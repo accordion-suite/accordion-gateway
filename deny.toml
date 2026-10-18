@@ -3,6 +3,16 @@
 
 [graph]
 all-features = true
+# The gateway runs only inside the server, which runs only on Linux. Checking
+# only these targets skips crates used on other platforms, such as the
+# bundled root certificates (webpki-root-certs, CDLA-Permissive-2.0) that
+# rustls-platform-verifier uses on Windows, macOS, and mobile.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+]
 
 [advisories]
 # To accept a specific advisory, add its ID here with a comment explaining why.

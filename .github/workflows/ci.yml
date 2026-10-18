@@ -11,3 +11,14 @@ permissions:
 jobs:
   rust:
     uses: accordion-suite/accordion/.github/workflows/rust.yml@main
+
+  # Gets real certificates from Pebble, Let's Encrypt's test certificate
+  # authority. Only this repo needs it, so it isn't in the shared workflow.
+  acme:
+    name: ACME against Pebble
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: scripts/test-acme.sh

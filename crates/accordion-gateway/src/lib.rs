@@ -4,7 +4,10 @@
 //! in the server binary, like the modules, rather than a separate process.
 //! See decisions 1 and 5 in the `accordion` repo's `docs/decisions`.
 
+pub mod acme;
+pub mod dns;
 pub mod host;
+mod http;
 pub mod name;
 pub mod redirect;
 pub mod tls;
