@@ -1,0 +1,23 @@
+[package]
+name = "accordion-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+axum = "0.8.9"
+hyper = "1.12.0"
+hyper-util = { version = "0.1.21", features = ["server-auto", "server-graceful", "service", "tokio"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
+thiserror = "2.0.21"
+tokio = { version = "1.53.3", features = ["macros", "net", "rt", "sync", "time"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring"] }
+tower = "0.5.3"
+tracing = "0.1.44"
+
+[dev-dependencies]
+http-body-util = "0.1.5"
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }
+tokio = { version = "1.53.3", features = ["io-util", "rt-multi-thread"] }
