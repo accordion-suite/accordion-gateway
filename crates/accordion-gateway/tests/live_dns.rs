@@ -11,7 +11,7 @@
 //! LIVE_NAME=accordion.example.com LIVE_TOKEN_FILE=~/.config/accordion/cloudflare-token \
 //!     cargo test --test live_dns cloudflare -- --ignored --nocapture
 //!
-//! LIVE_NAME=ourhome.dedyn.io LIVE_TOKEN_FILE=~/.config/accordion/desec-token \
+//! LIVE_NAME=accordion.example.org LIVE_TOKEN_FILE=~/.config/accordion/desec-token \
 //!     cargo test --test live_dns desec -- --ignored --nocapture
 //! ```
 

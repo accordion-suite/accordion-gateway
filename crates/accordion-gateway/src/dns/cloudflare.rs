@@ -2,7 +2,9 @@
 //!
 //! API reference: <https://developers.cloudflare.com/api/resources/dns/>.
 //! The token needs **Zone > DNS > Edit** and **Zone > Zone > Read**, limited to
-//! the one domain. Cloudflare can't limit a token to a single record, so the
+//! the one domain. Account API tokens and user API tokens both work. Cloudflare
+//! recommends account tokens for servers, because they don't belong to one
+//! person. Cloudflare can't limit a token to a single record, so the
 //! token can change any record in that domain. Households who want a narrower
 //! token can point `_acme-challenge` at a deSEC name with a CNAME instead.
 
