@@ -9,11 +9,16 @@ pub mod cloudflare;
 pub mod desec;
 
 use std::error::Error;
+use std::fmt;
 use std::future::Future;
+use std::str::FromStr;
 use std::time::Duration;
 
 pub use cloudflare::Cloudflare;
 pub use desec::Desec;
+use serde::{Deserialize, Serialize};
+
+use crate::http::BoxError;
 
 /// The longest part of a provider's error reply worth showing to the admin.
 const MAX_DETAIL_LEN: usize = 300;
@@ -44,6 +49,88 @@ pub trait DnsProvider: Send + Sync {
     /// many places, and Accordion can only ask the copy nearest to it, while
     /// the authority asks from several places that may update later.
     fn propagation_delay(&self) -> Duration;
+}
+
+/// The DNS hosts Accordion supports, as the admin names them in settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderKind {
+    Desec,
+    Cloudflare,
+}
+
+impl ProviderKind {
+    const ALL: [Self; 2] = [Self::Desec, Self::Cloudflare];
+
+    fn id(self) -> &'static str {
+        match self {
+            Self::Desec => "desec",
+            Self::Cloudflare => "cloudflare",
+        }
+    }
+}
+
+impl fmt::Display for ProviderKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Desec => "deSEC",
+            Self::Cloudflare => "Cloudflare",
+        })
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Accordion doesn't support the DNS provider \"{0}\". Use desec or cloudflare.")]
+pub struct UnknownProvider(String);
+
+impl FromStr for ProviderKind {
+    type Err = UnknownProvider;
+
+    fn from_str(input: &str) -> Result<Self, UnknownProvider> {
+        Self::ALL
+            .into_iter()
+            .find(|kind| kind.id().eq_ignore_ascii_case(input.trim()))
+            .ok_or_else(|| UnknownProvider(input.to_owned()))
+    }
+}
+
+/// Any supported provider, for when settings choose it at runtime.
+#[derive(Clone, Debug)]
+pub enum Provider {
+    Desec(Desec),
+    Cloudflare(Cloudflare),
+}
+
+impl Provider {
+    pub fn new(kind: ProviderKind, token: impl Into<String>) -> Result<Self, BoxError> {
+        Ok(match kind {
+            ProviderKind::Desec => Self::Desec(Desec::new(token)?),
+            ProviderKind::Cloudflare => Self::Cloudflare(Cloudflare::new(token)?),
+        })
+    }
+}
+
+impl DnsProvider for Provider {
+    async fn set_txt(&self, record: &str, value: &str) -> Result<(), DnsError> {
+        match self {
+            Self::Desec(dns) => dns.set_txt(record, value).await,
+            Self::Cloudflare(dns) => dns.set_txt(record, value).await,
+        }
+    }
+
+    async fn clear_txt(&self, record: &str) -> Result<(), DnsError> {
+        match self {
+            Self::Desec(dns) => dns.clear_txt(record).await,
+            Self::Cloudflare(dns) => dns.clear_txt(record).await,
+        }
+    }
+
+    fn propagation_delay(&self) -> Duration {
+        match self {
+            Self::Desec(dns) => dns.propagation_delay(),
+            Self::Cloudflare(dns) => dns.propagation_delay(),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -83,4 +170,22 @@ pub enum DnsError {
         provider: &'static str,
         source: Box<dyn Error + Send + Sync>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_provider_names() {
+        assert_eq!(
+            "desec".parse::<ProviderKind>().unwrap(),
+            ProviderKind::Desec
+        );
+        assert_eq!(
+            " Cloudflare ".parse::<ProviderKind>().unwrap(),
+            ProviderKind::Cloudflare
+        );
+        assert!("route53".parse::<ProviderKind>().is_err());
+    }
 }

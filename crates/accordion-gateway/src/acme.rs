@@ -60,6 +60,10 @@ impl Directory {
         }
     }
 
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
     fn builder(&self) -> Result<AccountBuilder, AcmeError> {
         Ok(match &self.root {
             Some(root) => Account::builder_with_root(root)?,

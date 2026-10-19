@@ -10,10 +10,16 @@ use axum::response::Redirect;
 
 use crate::ServerName;
 
-pub fn redirect_to_https(name: ServerName) -> Router {
+/// Redirects to `name` on HTTPS `port`, which is 443 except in testing.
+pub fn redirect_to_https(name: ServerName, port: u16) -> Router {
+    let origin = if port == 443 {
+        format!("https://{name}")
+    } else {
+        format!("https://{name}:{port}")
+    };
     Router::new().fallback(move |uri: Uri| {
         let target = format!(
-            "https://{name}{}",
+            "{origin}{}",
             uri.path_and_query().map_or("/", |path| path.as_str())
         );
         async move { Redirect::permanent(&target) }
@@ -31,7 +37,7 @@ mod tests {
 
     #[tokio::test]
     async fn keeps_the_path_and_query() {
-        let app = redirect_to_https("accordion.example.com".parse().unwrap());
+        let app = redirect_to_https("accordion.example.com".parse().unwrap(), 443);
         let request = Request::builder()
             .uri("/drive/files?sort=name")
             .header("host", "accordion.local")
@@ -42,6 +48,21 @@ mod tests {
         assert_eq!(
             response.headers()[LOCATION],
             "https://accordion.example.com/drive/files?sort=name"
+        );
+    }
+
+    #[tokio::test]
+    async fn keeps_a_port_other_than_443() {
+        let app = redirect_to_https("accordion.example.com".parse().unwrap(), 8443);
+        let request = Request::builder()
+            .uri("/")
+            .header("host", "accordion.local:8080")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.headers()[LOCATION],
+            "https://accordion.example.com:8443/"
         );
     }
 }

@@ -4,6 +4,8 @@ use std::fmt;
 use std::net::IpAddr;
 use std::str::FromStr;
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
 /// The longest name DNS allows, not counting the trailing dot.
 const MAX_NAME_LEN: usize = 253;
 const MAX_LABEL_LEN: usize = 63;
@@ -123,6 +125,22 @@ impl fmt::Display for ServerName {
 impl AsRef<str> for ServerName {
     fn as_ref(&self) -> &str {
         &self.0
+    }
+}
+
+impl Serialize for ServerName {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+// Parses, rather than trusting the stored text, so a hand-edited settings
+// file can't bring in a name the server would refuse.
+impl<'de> Deserialize<'de> for ServerName {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
     }
 }
 

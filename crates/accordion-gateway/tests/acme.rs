@@ -6,6 +6,7 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
 use accordion_gateway::acme::{AcmeAccount, AcmeError, Directory, renew_after};
+use accordion_gateway::certificates::Renewer;
 use accordion_gateway::dns::{DnsError, DnsProvider};
 use accordion_gateway::propagation::PropagationError;
 use accordion_gateway::tls::CertStore;
@@ -165,4 +166,49 @@ async fn stops_before_the_authority_looks_if_the_record_never_appears() {
         }
         other => panic!("expected the record not to appear, got {other:?}"),
     }
+}
+
+#[tokio::test]
+#[ignore = "needs Pebble; run scripts/test-acme.sh"]
+async fn keeps_the_certificate_across_restarts() {
+    let dir = tempfile::tempdir().unwrap();
+    let name: ServerName = "renewal.example.com".parse().unwrap();
+    let renewer = |store| {
+        Renewer::new(
+            dir.path(),
+            name.clone(),
+            ChallTestSrv::default(),
+            directory(),
+            check(),
+            store,
+        )
+    };
+
+    // With nothing saved, the loop gets a certificate right away.
+    let first = CertStore::new();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let running = tokio::spawn(renewer(first.clone()).run(async {
+        let _ = stopped.await;
+    }));
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while !first.has_certificate() {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("the renewal loop didn't get a certificate within a minute");
+    stop.send(()).unwrap();
+    running.await.unwrap();
+
+    // After a restart, the saved certificate is served without asking the
+    // certificate authority, and the saved account renews it.
+    let second = CertStore::new();
+    let restarted = renewer(second.clone());
+    let due = restarted
+        .load()
+        .unwrap()
+        .expect("the certificate was saved");
+    assert!(due > SystemTime::now());
+    assert!(second.has_certificate());
+    restarted.renew().await.unwrap();
 }
