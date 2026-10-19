@@ -9,8 +9,10 @@ pub mod dns;
 pub mod host;
 mod http;
 pub mod name;
+pub mod propagation;
 pub mod redirect;
 pub mod tls;
 
 pub use host::AllowedHosts;
 pub use name::ServerName;
+pub use propagation::PropagationCheck;

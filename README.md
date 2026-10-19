@@ -13,9 +13,10 @@ This repo is part of [Accordion](https://github.com/accordion-suite/accordion), 
 | `tls` | TLS 1.3 serving with a certificate that can be replaced without a restart |
 | `redirect` | The port 80 redirect to the HTTPS name |
 | `acme` | Getting certificates from Let's Encrypt with the DNS challenge, and deciding when to renew them |
-| `dns` | DNS providers that publish the challenge record. deSEC is the first. |
+| `dns` | DNS providers that publish the challenge record: deSEC and Cloudflare |
+| `propagation` | Waiting until every nameserver serves the challenge record, before the certificate authority looks |
 
-Cloudflare and RFC 2136 providers, and WireGuard remote access, are planned. [Decision 5](https://github.com/accordion-suite/accordion/blob/main/docs/decisions/0005-server-name-and-certificates.md) explains how the name and certificates work.
+An RFC 2136 provider and WireGuard remote access are planned. [Decision 5](https://github.com/accordion-suite/accordion/blob/main/docs/decisions/0005-server-name-and-certificates.md) explains how the name and certificates work.
 
 ## Building
 

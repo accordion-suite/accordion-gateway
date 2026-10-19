@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
-use hyper::{Request, StatusCode};
+use hyper::header::{AUTHORIZATION, CONTENT_TYPE};
+use hyper::{Method, Request, StatusCode};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::Client as LegacyClient;
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -61,7 +62,30 @@ impl Client {
         }
     }
 
-    pub async fn send(&self, request: Request<Full<Bytes>>) -> Result<Reply, BoxError> {
+    /// Sends a request with an `Authorization` header and, if given, a JSON
+    /// body. That's the shape of every DNS provider API call.
+    pub async fn send_json(
+        &self,
+        method: Method,
+        url: &str,
+        authorization: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<Reply, BoxError> {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(url)
+            .header(AUTHORIZATION, authorization);
+        let body = match body {
+            Some(body) => {
+                request = request.header(CONTENT_TYPE, "application/json");
+                Bytes::from(body.to_string())
+            }
+            None => Bytes::new(),
+        };
+        self.send(request.body(Full::new(body))?).await
+    }
+
+    async fn send(&self, request: Request<Full<Bytes>>) -> Result<Reply, BoxError> {
         let exchange = async {
             let response = self.inner.request(request).await?;
             let status = response.status();

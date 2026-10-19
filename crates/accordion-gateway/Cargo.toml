@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 axum = "0.8.9"
+hickory-resolver = "0.26.3"
 http-body-util = "0.1.5"
 hyper = "1.12.0"
 hyper-rustls = { version = "0.27.10", default-features = false, features = ["http1", "http2", "ring", "rustls-platform-verifier"] }

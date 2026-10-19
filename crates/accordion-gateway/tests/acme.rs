@@ -5,12 +5,20 @@
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
-use accordion_gateway::ServerName;
 use accordion_gateway::acme::{AcmeAccount, AcmeError, Directory, renew_after};
 use accordion_gateway::dns::{DnsError, DnsProvider};
+use accordion_gateway::propagation::PropagationError;
 use accordion_gateway::tls::CertStore;
+use accordion_gateway::{PropagationCheck, ServerName};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+
+/// Waits for records on Pebble's test DNS server, the way the server waits
+/// for a real zone's nameservers.
+fn check() -> PropagationCheck {
+    let address = std::env::var("CHALLTESTSRV_DNS").unwrap_or("127.0.0.1:8053".into());
+    PropagationCheck::with_nameservers(vec![address.parse().unwrap()])
+}
 
 fn directory() -> Directory {
     let url = std::env::var("PEBBLE_DIRECTORY").unwrap_or("https://localhost:14000/dir".into());
@@ -95,7 +103,7 @@ async fn issues_a_certificate_through_the_dns_challenge() {
     let dns = ChallTestSrv::default();
     let name: ServerName = "accordion.example.com".parse().unwrap();
 
-    let cert = account.issue(&name, &dns).await.unwrap();
+    let cert = account.issue(&name, &dns, &check()).await.unwrap();
 
     // The TLS server accepts it, which also checks that the key matches.
     let certs = CertStore::new();
@@ -114,7 +122,7 @@ async fn issues_a_certificate_through_the_dns_challenge() {
         .await
         .unwrap();
     let renewed = restored
-        .issue(&name, &ChallTestSrv::default())
+        .issue(&name, &ChallTestSrv::default(), &check())
         .await
         .unwrap();
     certs
@@ -128,7 +136,10 @@ async fn explains_a_failed_challenge() {
     let (account, _) = AcmeAccount::create(&directory()).await.unwrap();
     let name: ServerName = "missing-record.example.com".parse().unwrap();
 
-    let result = account.issue(&name, &Forgetful).await;
+    // Skip the check, so the authority itself looks for the missing record.
+    let result = account
+        .issue(&name, &Forgetful, &PropagationCheck::skip())
+        .await;
 
     match result {
         Err(AcmeError::Validation { name, detail }) => {
@@ -136,5 +147,22 @@ async fn explains_a_failed_challenge() {
             assert!(!detail.is_empty());
         }
         other => panic!("expected a validation error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs Pebble; run scripts/test-acme.sh"]
+async fn stops_before_the_authority_looks_if_the_record_never_appears() {
+    let (account, _) = AcmeAccount::create(&directory()).await.unwrap();
+    let name: ServerName = "never-published.example.com".parse().unwrap();
+
+    let check = check().timeout(Duration::from_secs(6));
+    let result = account.issue(&name, &Forgetful, &check).await;
+
+    match result {
+        Err(AcmeError::Propagation(PropagationError::NotPropagated { record, .. })) => {
+            assert_eq!(record, "_acme-challenge.never-published.example.com");
+        }
+        other => panic!("expected the record not to appear, got {other:?}"),
     }
 }

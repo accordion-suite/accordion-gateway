@@ -20,6 +20,7 @@ pub use instant_acme::AccountCredentials;
 
 use crate::ServerName;
 use crate::dns::{DnsError, DnsProvider};
+use crate::propagation::{PropagationCheck, PropagationError};
 
 /// How long to wait for the certificate authority to check the DNS record,
 /// and then to issue the certificate.
@@ -80,6 +81,8 @@ pub enum AcmeError {
          that the DNS provider settings are for this name, then try again."
     )]
     Validation { name: String, detail: String },
+    #[error(transparent)]
+    Propagation(#[from] PropagationError),
     #[error("Accordion couldn't read the certificate: {0}")]
     Certificate(String),
 }
@@ -131,18 +134,20 @@ impl AcmeAccount {
     }
 
     /// Gets a certificate for `name`, proving control of it with a TXT
-    /// record that `dns` publishes. The record is removed afterward, whether
-    /// or not issuing succeeds.
+    /// record that `dns` publishes. `check` confirms the record is live
+    /// before the authority looks for it. The record is removed afterward,
+    /// whether or not issuing succeeds.
     pub async fn issue<D: DnsProvider>(
         &self,
         name: &ServerName,
         dns: &D,
+        check: &PropagationCheck,
     ) -> Result<IssuedCert, AcmeError> {
         let identifiers = [Identifier::Dns(name.to_string())];
         let mut order = self.account.new_order(&NewOrder::new(&identifiers)).await?;
 
         let mut records = Vec::new();
-        let result = match publish_challenges(&mut order, dns, &mut records).await {
+        let result = match publish_challenges(&mut order, dns, check, &mut records).await {
             Ok(()) => finish(&mut order, name).await,
             Err(err) => Err(err),
         };
@@ -156,11 +161,12 @@ impl AcmeAccount {
     }
 }
 
-/// Publishes the TXT record for each pending authorization, waits for it to
-/// reach the provider's nameservers, then tells the authority to check.
+/// Publishes the TXT record for each pending authorization, waits until the
+/// provider's nameservers serve it, then tells the authority to check.
 async fn publish_challenges<D: DnsProvider>(
     order: &mut Order,
     dns: &D,
+    check: &PropagationCheck,
     records: &mut Vec<String>,
 ) -> Result<(), AcmeError> {
     let mut authorizations = order.authorizations();
@@ -175,9 +181,10 @@ async fn publish_challenges<D: DnsProvider>(
             .ok_or_else(|| AcmeError::NoDnsChallenge(identifier.clone()))?;
 
         let record = format!("_acme-challenge.{identifier}");
-        dns.set_txt(&record, &challenge.key_authorization().dns_value())
-            .await?;
-        records.push(record);
+        let value = challenge.key_authorization().dns_value();
+        dns.set_txt(&record, &value).await?;
+        records.push(record.clone());
+        check.wait_for_txt(&record, &value).await?;
         tokio::time::sleep(dns.propagation_delay()).await;
         challenge.set_ready().await?;
     }

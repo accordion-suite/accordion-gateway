@@ -8,25 +8,20 @@
 use std::fmt;
 use std::time::Duration;
 
-use http_body_util::Full;
-use hyper::body::Bytes;
-use hyper::header::{AUTHORIZATION, CONTENT_TYPE};
-use hyper::{Method, Request, StatusCode};
+use hyper::{Method, StatusCode};
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{DnsError, DnsProvider};
+use super::{DnsError, DnsProvider, short_detail};
 use crate::http::{BoxError, Client, Reply};
 
 const PROVIDER: &str = "deSEC";
 const API: &str = "https://desec.io/api/v1";
 
-/// deSEC doesn't document how long a change takes to reach its nameservers.
-/// This is a starting value until Accordion checks the nameservers directly.
-const PROPAGATION_DELAY: Duration = Duration::from_secs(60);
-
-/// The longest part of an error reply worth showing to the admin.
-const MAX_DETAIL_LEN: usize = 300;
+/// In a test on October 19, 2026, `ns1.desec.io` served a new record after 6
+/// seconds and `ns2.desec.org` after 59. Accordion waits for both, then this
+/// long more for their copies elsewhere. It's a starting value to tune.
+const PROPAGATION_DELAY: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct Desec {
@@ -96,21 +91,14 @@ impl Desec {
         url: &str,
         body: Option<serde_json::Value>,
     ) -> Result<Reply, DnsError> {
-        let mut request = Request::builder()
-            .method(method)
-            .uri(url)
-            .header(AUTHORIZATION, format!("Token {}", self.token));
-        let body = match body {
-            Some(body) => {
-                request = request.header(CONTENT_TYPE, "application/json");
-                Bytes::from(body.to_string())
-            }
-            None => Bytes::new(),
-        };
-        let request = request
-            .body(Full::new(body))
-            .map_err(|err| unreachable(err.into()))?;
-        self.client.send(request).await.map_err(unreachable)
+        let authorization = format!("Token {}", self.token);
+        self.client
+            .send_json(method, url, &authorization, body.as_ref())
+            .await
+            .map_err(|source| DnsError::Unreachable {
+                provider: PROVIDER,
+                source,
+            })
     }
 }
 
@@ -138,26 +126,11 @@ fn check(reply: &Reply, record: &str) -> Result<(), DnsError> {
             provider: PROVIDER,
             name: record.to_owned(),
         }),
-        status => {
-            let mut detail = String::from_utf8_lossy(&reply.body).into_owned();
-            if detail.len() > MAX_DETAIL_LEN {
-                let end = detail.floor_char_boundary(MAX_DETAIL_LEN);
-                detail.truncate(end);
-                detail.push('…');
-            }
-            Err(DnsError::Rejected {
-                provider: PROVIDER,
-                status: status.as_u16(),
-                detail,
-            })
-        }
-    }
-}
-
-fn unreachable(source: BoxError) -> DnsError {
-    DnsError::Unreachable {
-        provider: PROVIDER,
-        source,
+        status => Err(DnsError::Rejected {
+            provider: PROVIDER,
+            status: status.as_u16(),
+            detail: short_detail(&String::from_utf8_lossy(&reply.body)),
+        }),
     }
 }
 
@@ -207,6 +180,7 @@ mod tests {
     use axum::Router;
     use axum::extract::{Query, State};
     use axum::http::HeaderMap;
+    use axum::http::header::AUTHORIZATION;
     use axum::routing::{get, put};
     use serde_json::Value;
 
