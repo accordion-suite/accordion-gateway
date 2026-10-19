@@ -21,6 +21,7 @@ use tracing::{error, info, warn};
 use crate::acme::{AccountCredentials, AcmeAccount, AcmeError, Directory, renew_after};
 use crate::dns::{DnsProvider, Provider, ProviderKind};
 use crate::http::BoxError;
+use crate::retry;
 use crate::tls::CertStore;
 use crate::{PropagationCheck, ServerName};
 
@@ -275,7 +276,7 @@ impl<D: DnsProvider> Renewer<D> {
                 }
                 Err(err) => {
                     failures += 1;
-                    let delay = retry_delay(failures);
+                    let delay = retry::delay(failures, FIRST_RETRY_DELAY, MAX_RETRY_DELAY);
                     error!(
                         name = %self.name,
                         "{err} Accordion will try again in {} minutes.",
@@ -304,15 +305,6 @@ impl<D: DnsProvider> Renewer<D> {
         write_private_json(&path, &saved)?;
         Ok(account)
     }
-}
-
-fn retry_delay(failures: u32) -> Duration {
-    let factor = 1u32
-        .checked_shl(failures.saturating_sub(1))
-        .unwrap_or(u32::MAX);
-    FIRST_RETRY_DELAY
-        .saturating_mul(factor)
-        .min(MAX_RETRY_DELAY)
 }
 
 fn days_until(time: SystemTime) -> u64 {
@@ -392,6 +384,10 @@ mod tests {
         }
 
         async fn clear_txt(&self, _: &str) -> Result<(), DnsError> {
+            unreachable!()
+        }
+
+        async fn set_address(&self, _: &str, _: std::net::IpAddr) -> Result<(), DnsError> {
             unreachable!()
         }
 
@@ -487,15 +483,5 @@ mod tests {
             Directory::lets_encrypt(),
         );
         assert!(production.load().unwrap().is_none());
-    }
-
-    #[test]
-    fn retries_less_often_after_each_failure() {
-        let minutes = |failures| retry_delay(failures).as_secs() / 60;
-        assert_eq!(minutes(1), 15);
-        assert_eq!(minutes(2), 30);
-        assert_eq!(minutes(3), 60);
-        assert_eq!(minutes(7), 12 * 60);
-        assert_eq!(minutes(100), 12 * 60);
     }
 }

@@ -14,7 +14,8 @@ This repo is part of [Accordion](https://github.com/accordion-suite/accordion), 
 | `redirect` | The port 80 redirect to the HTTPS name |
 | `acme` | Getting certificates from Let's Encrypt with the DNS challenge, and deciding when to renew them |
 | `certificates` | Storing the server's name, DNS settings, and certificate, and renewing the certificate in the background |
-| `dns` | DNS providers that publish the challenge record: deSEC and Cloudflare |
+| `dns` | DNS providers that publish the challenge and address records: deSEC and Cloudflare |
+| `address` | Pointing the server's name at its address on the home network, and updating it when the address changes |
 | `propagation` | Waiting until every nameserver serves the challenge record, before the certificate authority looks |
 
 An RFC 2136 provider and WireGuard remote access are planned. [Decision 5](https://github.com/accordion-suite/accordion/blob/main/docs/decisions/0005-server-name-and-certificates.md) explains how the name and certificates work.

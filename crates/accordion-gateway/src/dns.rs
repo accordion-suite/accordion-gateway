@@ -1,9 +1,10 @@
-//! Publishing the DNS records that prove the server controls its name.
+//! Publishing the server's DNS records through the DNS host's API.
 //!
 //! To issue a certificate, the certificate authority looks up a TXT record at
-//! `_acme-challenge.<name>`. Each DNS host Accordion supports has a provider
-//! here that sets and removes that record through the host's API. See
-//! decision 5 in the `accordion` repo's `docs/decisions`.
+//! `_acme-challenge.<name>`. Clients look up the name's address record to
+//! find the server. Each DNS host Accordion supports has a provider here that
+//! sets those records. See decision 5 in the `accordion` repo's
+//! `docs/decisions`.
 
 pub mod cloudflare;
 pub mod desec;
@@ -11,6 +12,7 @@ pub mod desec;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
+use std::net::IpAddr;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -22,6 +24,19 @@ use crate::http::BoxError;
 
 /// The longest part of a provider's error reply worth showing to the admin.
 const MAX_DETAIL_LEN: usize = 300;
+
+/// The TTL for the server's address record, where the provider allows it.
+/// Five minutes lets clients follow an address change quickly without asking
+/// the nameservers on every connection.
+const ADDRESS_TTL: u32 = 300;
+
+/// The record type that holds `address`.
+fn address_type(address: IpAddr) -> &'static str {
+    match address {
+        IpAddr::V4(_) => "A",
+        IpAddr::V6(_) => "AAAA",
+    }
+}
 
 fn short_detail(detail: &str) -> String {
     if detail.len() <= MAX_DETAIL_LEN {
@@ -43,6 +58,14 @@ pub trait DnsProvider: Send + Sync {
     /// Removes the TXT records at `record`. Removing a record that doesn't
     /// exist isn't an error.
     fn clear_txt(&self, record: &str) -> impl Future<Output = Result<(), DnsError>> + Send;
+
+    /// Points `name` at `address`, replacing the name's other records of
+    /// the same type: A for IPv4, or AAAA for IPv6.
+    fn set_address(
+        &self,
+        name: &str,
+        address: IpAddr,
+    ) -> impl Future<Output = Result<(), DnsError>> + Send;
 
     /// Extra time to wait after the provider's nameservers serve the record,
     /// before the certificate authority looks for it. Each nameserver runs in
@@ -122,6 +145,13 @@ impl DnsProvider for Provider {
         match self {
             Self::Desec(dns) => dns.clear_txt(record).await,
             Self::Cloudflare(dns) => dns.clear_txt(record).await,
+        }
+    }
+
+    async fn set_address(&self, name: &str, address: IpAddr) -> Result<(), DnsError> {
+        match self {
+            Self::Desec(dns) => dns.set_address(name, address).await,
+            Self::Cloudflare(dns) => dns.set_address(name, address).await,
         }
     }
 

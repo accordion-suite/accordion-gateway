@@ -9,6 +9,7 @@
 //! token can point `_acme-challenge` at a deSEC name with a CNAME instead.
 
 use std::fmt;
+use std::net::IpAddr;
 use std::time::Duration;
 
 use hyper::{Method, StatusCode};
@@ -16,7 +17,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::json;
 
-use super::{DnsError, DnsProvider, short_detail};
+use super::{ADDRESS_TTL, DnsError, DnsProvider, address_type, short_detail};
 use crate::http::{BoxError, Client, Reply};
 
 const PROVIDER: &str = "Cloudflare";
@@ -64,6 +65,12 @@ struct Zone {
 #[derive(Deserialize)]
 struct Record {
     id: String,
+    #[serde(default)]
+    content: String,
+    #[serde(default)]
+    proxied: bool,
+    #[serde(default)]
+    ttl: u32,
 }
 
 impl Cloudflare {
@@ -106,17 +113,37 @@ impl Cloudflare {
         })
     }
 
-    async fn delete_txt(&self, zone: &Zone, record: &str) -> Result<(), DnsError> {
+    async fn records(
+        &self,
+        zone: &Zone,
+        record_type: &str,
+        name: &str,
+    ) -> Result<Vec<Record>, DnsError> {
         let url = format!(
-            "{}/zones/{}/dns_records?type=TXT&name={record}",
+            "{}/zones/{}/dns_records?type={record_type}&name={name}",
             self.api, zone.id
         );
-        let existing: Vec<Record> = self.call(Method::GET, &url, None, record).await?;
-        for old in existing {
+        self.call(Method::GET, &url, None, name).await
+    }
+
+    async fn delete(&self, zone: &Zone, records: Vec<Record>, name: &str) -> Result<(), DnsError> {
+        for old in records {
             let url = format!("{}/zones/{}/dns_records/{}", self.api, zone.id, old.id);
-            self.call::<serde_json::Value>(Method::DELETE, &url, None, record)
+            self.call::<serde_json::Value>(Method::DELETE, &url, None, name)
                 .await?;
         }
+        Ok(())
+    }
+
+    async fn create(
+        &self,
+        zone: &Zone,
+        body: serde_json::Value,
+        name: &str,
+    ) -> Result<(), DnsError> {
+        let url = format!("{}/zones/{}/dns_records", self.api, zone.id);
+        self.call::<serde_json::Value>(Method::POST, &url, Some(body), name)
+            .await?;
         Ok(())
     }
 
@@ -187,8 +214,8 @@ impl DnsProvider for Cloudflare {
         let zone = self.zone_for(record).await?;
         // Remove leftovers from an earlier attempt, so the authority sees
         // only the current value.
-        self.delete_txt(&zone, record).await?;
-        let url = format!("{}/zones/{}/dns_records", self.api, zone.id);
+        let stale = self.records(&zone, "TXT", record).await?;
+        self.delete(&zone, stale, record).await?;
         let body = json!({
             "type": "TXT",
             "name": record,
@@ -197,14 +224,41 @@ impl DnsProvider for Cloudflare {
             "content": format!("\"{value}\""),
             "ttl": TTL,
         });
-        self.call::<serde_json::Value>(Method::POST, &url, Some(body), record)
-            .await?;
-        Ok(())
+        self.create(&zone, body, record).await
     }
 
     async fn clear_txt(&self, record: &str) -> Result<(), DnsError> {
         let zone = self.zone_for(record).await?;
-        self.delete_txt(&zone, record).await
+        let existing = self.records(&zone, "TXT", record).await?;
+        self.delete(&zone, existing, record).await
+    }
+
+    async fn set_address(&self, name: &str, address: IpAddr) -> Result<(), DnsError> {
+        let zone = self.zone_for(name).await?;
+        let record_type = address_type(address);
+        let content = address.to_string();
+        let existing = self.records(&zone, record_type, name).await?;
+        // Leave a correct record alone, so restarts don't change DNS.
+        if let [only] = existing.as_slice()
+            && only.content == content
+            && only.ttl == ADDRESS_TTL
+            && !only.proxied
+        {
+            return Ok(());
+        }
+        // Cloudflare can't replace a set of records in one call. The name
+        // has no address for a moment between these calls, which is fine,
+        // since the old address is wrong anyway.
+        self.delete(&zone, existing, name).await?;
+        let body = json!({
+            "type": record_type,
+            "name": name,
+            "content": content,
+            "ttl": ADDRESS_TTL,
+            // Cloudflare's proxy can't reach an address on the home network.
+            "proxied": false,
+        });
+        self.create(&zone, body, name).await
     }
 
     fn propagation_delay(&self) -> Duration {
@@ -322,6 +376,28 @@ mod tests {
         assert_eq!(
             fake.created.lock().unwrap()[0],
             json!({ "type": "TXT", "name": record, "content": "\"abc123\"", "ttl": 60 })
+        );
+    }
+
+    #[tokio::test]
+    async fn replaces_a_wrong_address() {
+        let (cloudflare, fake) = start().await;
+
+        cloudflare
+            .set_address("accordion.example.com", "192.168.1.20".parse().unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(*fake.changes.lock().unwrap(), ["delete stale", "create"]);
+        assert_eq!(
+            fake.created.lock().unwrap()[0],
+            json!({
+                "type": "A",
+                "name": "accordion.example.com",
+                "content": "192.168.1.20",
+                "ttl": 300,
+                "proxied": false,
+            })
         );
     }
 

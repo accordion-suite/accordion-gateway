@@ -1,18 +1,19 @@
-//! deSEC (desec.io), a DNS host run by a nonprofit that offers free
-//! subdomains under `dedyn.io`.
+//! deSEC (desec.io), a DNS host run by a nonprofit. It offered free
+//! subdomains under `dedyn.io`, but has suspended new ones.
 //!
 //! API reference: <https://desec.readthedocs.io/en/latest/dns/rrsets.html>.
-//! The admin guide should explain how to limit the token to the one
-//! `_acme-challenge` TXT record with a token policy.
+//! The admin guide should explain how to limit the token with token policies
+//! to two records: the `_acme-challenge` TXT record and the name's A record.
 
 use std::fmt;
+use std::net::IpAddr;
 use std::time::Duration;
 
 use hyper::{Method, StatusCode};
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{DnsError, DnsProvider, short_detail};
+use super::{ADDRESS_TTL, DnsError, DnsProvider, address_type, short_detail};
 use crate::http::{BoxError, Client, Reply};
 
 const PROVIDER: &str = "deSEC";
@@ -159,6 +160,18 @@ impl DnsProvider for Desec {
             .await
     }
 
+    async fn set_address(&self, name: &str, address: IpAddr) -> Result<(), DnsError> {
+        let domain = self.domain_for(name).await?;
+        let rrset = json!({
+            "subname": subname(name, &domain.name),
+            "type": address_type(address),
+            "ttl": ADDRESS_TTL.max(domain.minimum_ttl),
+            "records": [address.to_string()],
+        });
+        self.write_rrset(Method::PUT, &domain.name, rrset, name)
+            .await
+    }
+
     fn propagation_delay(&self) -> Duration {
         PROPAGATION_DELAY
     }
@@ -249,6 +262,33 @@ mod tests {
         assert_eq!(
             writes[1].1,
             json!([{ "subname": "_acme-challenge.accordion", "type": "TXT", "records": [] }])
+        );
+    }
+
+    #[tokio::test]
+    async fn points_the_name_at_the_server() {
+        let (desec, fake) = start(StatusCode::OK).await;
+
+        desec
+            .set_address("accordion.example.com", "192.168.1.20".parse().unwrap())
+            .await
+            .unwrap();
+        desec
+            .set_address("example.com", "fd00::20".parse().unwrap())
+            .await
+            .unwrap();
+
+        let writes = fake.writes.lock().unwrap();
+        assert_eq!(
+            writes[0],
+            (
+                "PUT".into(),
+                json!([{ "subname": "accordion", "type": "A", "ttl": 3600, "records": ["192.168.1.20"] }])
+            )
+        );
+        assert_eq!(
+            writes[1].1,
+            json!([{ "subname": "", "type": "AAAA", "ttl": 3600, "records": ["fd00::20"] }])
         );
     }
 

@@ -2,6 +2,7 @@
 //! authority. `scripts/test-acme.sh` downloads and starts Pebble, then runs
 //! these tests.
 
+use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
@@ -73,6 +74,16 @@ impl DnsProvider for ChallTestSrv {
         self.post("/clear-txt", body.to_string()).await
     }
 
+    async fn set_address(&self, name: &str, address: IpAddr) -> Result<(), DnsError> {
+        let path = if address.is_ipv4() {
+            "/add-a"
+        } else {
+            "/add-aaaa"
+        };
+        let body = serde_json::json!({ "host": format!("{name}."), "addresses": [address] });
+        self.post(path, body.to_string()).await
+    }
+
     fn propagation_delay(&self) -> Duration {
         Duration::ZERO
     }
@@ -88,6 +99,10 @@ impl DnsProvider for Forgetful {
     }
 
     async fn clear_txt(&self, _record: &str) -> Result<(), DnsError> {
+        Ok(())
+    }
+
+    async fn set_address(&self, _name: &str, _address: IpAddr) -> Result<(), DnsError> {
         Ok(())
     }
 

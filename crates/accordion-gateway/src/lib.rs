@@ -6,6 +6,7 @@
 //! See decisions 1 and 5 in the `accordion` repo's `docs/decisions`.
 
 pub mod acme;
+pub mod address;
 pub mod certificates;
 pub mod dns;
 pub mod host;
@@ -13,6 +14,7 @@ mod http;
 pub mod name;
 pub mod propagation;
 pub mod redirect;
+mod retry;
 pub mod tls;
 
 pub use host::AllowedHosts;

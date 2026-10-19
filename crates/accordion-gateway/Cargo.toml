@@ -27,4 +27,4 @@ x509-parser = "0.18.1"
 [dev-dependencies]
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }
 tempfile = "3.27.0"
-tokio = { version = "1.53.3", features = ["io-util", "rt-multi-thread"] }
+tokio = { version = "1.53.3", features = ["io-util", "rt-multi-thread", "test-util"] }
