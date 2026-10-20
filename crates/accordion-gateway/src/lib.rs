@@ -11,6 +11,7 @@ pub mod certificates;
 pub mod dns;
 pub mod host;
 mod http;
+pub mod local_name;
 pub mod name;
 pub mod propagation;
 pub mod redirect;
