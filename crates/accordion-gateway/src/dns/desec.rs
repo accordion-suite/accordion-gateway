@@ -40,6 +40,13 @@ struct Domain {
     minimum_ttl: u32,
 }
 
+/// The parts of an RRset that Accordion compares.
+#[derive(Debug, Deserialize)]
+struct Rrset {
+    ttl: u32,
+    records: Vec<String>,
+}
+
 impl Desec {
     pub fn new(token: impl Into<String>) -> Result<Self, BoxError> {
         Ok(Self {
@@ -72,6 +79,31 @@ impl Desec {
             provider: PROVIDER,
             name: record.to_owned(),
         })
+    }
+
+    /// The RRset at `subname` with this type, or `None` if there isn't one.
+    async fn rrset(
+        &self,
+        domain: &str,
+        subname: &str,
+        kind: &str,
+        record: &str,
+    ) -> Result<Option<Rrset>, DnsError> {
+        // deSEC names the domain's own RRsets "@" in URLs.
+        let subname = if subname.is_empty() { "@" } else { subname };
+        let url = format!("{}/domains/{domain}/rrsets/{subname}/{kind}/", self.api);
+        let reply = self.send(Method::GET, &url, None).await?;
+        if reply.status == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        check(&reply, record)?;
+        serde_json::from_slice(&reply.body)
+            .map(Some)
+            .map_err(|err| DnsError::Rejected {
+                provider: PROVIDER,
+                status: reply.status.as_u16(),
+                detail: format!("unexpected reply: {err}"),
+            })
     }
 
     /// Changes one RRset with the bulk endpoint, which creates the RRset if
@@ -164,10 +196,24 @@ impl DnsProvider for Desec {
 
     async fn set_address(&self, name: &str, address: IpAddr) -> Result<(), DnsError> {
         let domain = self.domain_for(name).await?;
+        let subname = subname(name, &domain.name);
+        let kind = address_type(address);
+        let ttl = ADDRESS_TTL.max(domain.minimum_ttl);
+        // Leave a correct record alone, so a restart doesn't write to DNS or
+        // count against deSEC's limits on changes.
+        if let Some(current) = self.rrset(&domain.name, subname, kind, name).await? {
+            let same_address = match current.records.as_slice() {
+                [record] => record.parse() == Ok(address),
+                _ => false,
+            };
+            if same_address && current.ttl == ttl {
+                return Ok(());
+            }
+        }
         let rrset = json!({
-            "subname": subname(name, &domain.name),
-            "type": address_type(address),
-            "ttl": ADDRESS_TTL.max(domain.minimum_ttl),
+            "subname": subname,
+            "type": kind,
+            "ttl": ttl,
             "records": [address.to_string()],
         });
         self.write_rrset(Method::PUT, &domain.name, rrset, name)
@@ -193,7 +239,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use axum::Router;
-    use axum::extract::{Query, State};
+    use axum::extract::{Path, Query, State};
     use axum::http::HeaderMap;
     use axum::http::header::AUTHORIZATION;
     use axum::routing::{get, put};
@@ -227,6 +273,10 @@ mod tests {
                 "/domains/example.com/rrsets/",
                 put(record_write).patch(record_write),
             )
+            .route(
+                "/domains/example.com/rrsets/{subname}/{kind}/",
+                get(read_rrset),
+            )
             .with_state((fake.clone(), status));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let api = format!("http://{}", listener.local_addr().unwrap());
@@ -244,6 +294,27 @@ mod tests {
             .unwrap()
             .push((method.to_string(), serde_json::from_str(&body).unwrap()));
         (status, r#"{"detail": "Throttled."}"#)
+    }
+
+    /// Answers with the latest write to the RRset, as deSEC would.
+    async fn read_rrset(
+        State((fake, _)): State<(FakeDesec, StatusCode)>,
+        Path((subname, kind)): Path<(String, String)>,
+    ) -> (StatusCode, String) {
+        let subname = if subname == "@" { "" } else { &subname };
+        let writes = fake.writes.lock().unwrap();
+        let latest = writes
+            .iter()
+            .rev()
+            .map(|(_, body)| &body[0])
+            .find(|rrset| rrset["subname"] == subname && rrset["type"] == kind.as_str());
+        match latest {
+            Some(rrset) => (StatusCode::OK, rrset.to_string()),
+            None => (
+                StatusCode::NOT_FOUND,
+                r#"{"detail": "Not found."}"#.to_owned(),
+            ),
+        }
     }
 
     #[tokio::test]
@@ -281,6 +352,7 @@ mod tests {
             .unwrap();
 
         let writes = fake.writes.lock().unwrap();
+        assert_eq!(writes.len(), 2);
         assert_eq!(
             writes[0],
             (
@@ -292,6 +364,32 @@ mod tests {
             writes[1].1,
             json!([{ "subname": "", "type": "AAAA", "ttl": 3600, "records": ["fd00::20"] }])
         );
+    }
+
+    #[tokio::test]
+    async fn leaves_a_correct_address_alone() {
+        let (desec, fake) = start(StatusCode::OK).await;
+        let name = "accordion.example.com";
+
+        desec
+            .set_address(name, "192.168.1.20".parse().unwrap())
+            .await
+            .unwrap();
+        desec
+            .set_address(name, "192.168.1.20".parse().unwrap())
+            .await
+            .unwrap();
+        desec
+            .set_address(name, "192.168.1.21".parse().unwrap())
+            .await
+            .unwrap();
+
+        let writes = fake.writes.lock().unwrap();
+        let addresses: Vec<_> = writes
+            .iter()
+            .map(|(_, body)| &body[0]["records"][0])
+            .collect();
+        assert_eq!(addresses, ["192.168.1.20", "192.168.1.21"]);
     }
 
     #[tokio::test]
