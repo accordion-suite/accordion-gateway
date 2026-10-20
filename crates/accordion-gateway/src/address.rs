@@ -65,6 +65,49 @@ pub fn detect_address() -> io::Result<Ipv4Addr> {
     }
 }
 
+/// The machine's IPv4 addresses on the networks it's part of, with the
+/// address from [`detect_address`] first. A server can be on more than one,
+/// such as a Raspberry Pi that's also a Wi-Fi access point, and the setup
+/// wizard is reachable on each. Only private addresses are added after the
+/// first, because the wizard only answers devices on private networks.
+pub fn network_addresses() -> Vec<Ipv4Addr> {
+    let interfaces = if_addrs::get_if_addrs().unwrap_or_default();
+    pick_network_addresses(
+        detect_address().ok(),
+        interfaces
+            .iter()
+            .filter_map(|interface| match &interface.addr {
+                if_addrs::IfAddr::V4(addr) if interface.is_oper_up() => {
+                    Some((interface.name.as_str(), addr.ip))
+                }
+                _ => None,
+            }),
+    )
+}
+
+/// Interface names that other devices can't reach: loopback, which WSL also
+/// gives a private address, and the networks that containers and virtual
+/// machines use.
+const SKIPPED_INTERFACES: &[&str] = &[
+    "lo", "docker", "br-", "veth", "virbr", "vmnet", "vboxnet", "cni", "flannel", "podman", "lxc",
+];
+
+fn pick_network_addresses<'a>(
+    main: Option<Ipv4Addr>,
+    interfaces: impl Iterator<Item = (&'a str, Ipv4Addr)>,
+) -> Vec<Ipv4Addr> {
+    let mut addresses: Vec<Ipv4Addr> = main.into_iter().collect();
+    for (name, address) in interfaces {
+        let skipped = SKIPPED_INTERFACES
+            .iter()
+            .any(|prefix| name.starts_with(prefix));
+        if !skipped && address.is_private() && !addresses.contains(&address) {
+            addresses.push(address);
+        }
+    }
+    addresses
+}
+
 /// How the name's address record is doing, for the health page.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AddressStatus {
@@ -193,6 +236,27 @@ mod tests {
     use crate::dns::DnsError;
 
     use super::*;
+
+    #[test]
+    fn lists_the_main_address_first_and_leaves_out_unreachable_ones() {
+        let address = |text: &str| text.parse::<Ipv4Addr>().unwrap();
+        let interfaces = [
+            ("lo", address("127.0.0.1")),
+            ("lo", address("10.255.255.254")),
+            ("wlan0", address("10.42.0.1")),
+            ("end0", address("192.168.1.57")),
+            ("docker0", address("172.17.0.1")),
+            ("br-5f2a", address("10.21.0.1")),
+            ("tailscale0", address("100.64.0.7")),
+        ];
+        assert_eq!(
+            pick_network_addresses(Some(address("192.168.1.57")), interfaces.into_iter()),
+            [address("192.168.1.57"), address("10.42.0.1")]
+        );
+        assert!(
+            pick_network_addresses(None, [("lo", address("127.0.0.1"))].into_iter()).is_empty()
+        );
+    }
 
     /// Records each address it's asked to publish, and fails the first time.
     #[derive(Clone, Default)]

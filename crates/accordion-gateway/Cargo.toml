@@ -13,6 +13,7 @@ http-body-util = "0.1.5"
 hyper = "1.12.0"
 hyper-rustls = { version = "0.27.10", default-features = false, features = ["http1", "http2", "ring", "rustls-platform-verifier"] }
 hyper-util = { version = "0.1.21", features = ["client-legacy", "http1", "http2", "server-auto", "service", "tokio"] }
+if-addrs = "0.15.0"
 instant-acme = { version = "0.8.5", default-features = false, features = ["hyper-rustls", "rcgen", "ring"] }
 mdns-sd = "0.21.5"
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
