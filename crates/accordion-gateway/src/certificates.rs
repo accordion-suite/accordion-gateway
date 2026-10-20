@@ -16,9 +16,10 @@ use std::time::{Duration, SystemTime};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
 use tracing::{error, info, warn};
 
-use crate::acme::{AccountCredentials, AcmeAccount, AcmeError, Directory, renew_after};
+use crate::acme::{AccountCredentials, AcmeAccount, AcmeError, Directory, Validity, validity};
 use crate::dns::{DnsProvider, Provider, ProviderKind};
 use crate::http::BoxError;
 use crate::retry;
@@ -142,6 +143,22 @@ pub enum CertificateError {
     Save { path: PathBuf, source: io::Error },
 }
 
+/// How the certificate is doing, for the health page.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CertificateStatus {
+    /// When the certificate being served expires and when Accordion renews
+    /// it, or `None` until there's a certificate.
+    pub validity: Option<Validity>,
+    /// Whether Accordion is getting a certificate now.
+    pub renewing: bool,
+    /// How many renewals in a row have failed. A success resets it.
+    pub failures: u32,
+    /// Why the last renewal failed, until one succeeds.
+    pub last_error: Option<String>,
+    /// When Accordion tries again after a failure.
+    pub retry_at: Option<SystemTime>,
+}
+
 /// Gets, stores, and renews the certificate for one name.
 pub struct Renewer<D> {
     dir: PathBuf,
@@ -150,6 +167,7 @@ pub struct Renewer<D> {
     directory: Directory,
     check: PropagationCheck,
     store: Arc<CertStore>,
+    status: watch::Sender<CertificateStatus>,
 }
 
 impl Renewer<Provider> {
@@ -189,7 +207,13 @@ impl<D: DnsProvider> Renewer<D> {
             directory,
             check,
             store,
+            status: watch::Sender::default(),
         }
+    }
+
+    /// Follows the certificate's status as the renewer works.
+    pub fn status(&self) -> watch::Receiver<CertificateStatus> {
+        self.status.subscribe()
     }
 
     /// Loads the saved certificate into the store and returns when to renew
@@ -207,11 +231,13 @@ impl<D: DnsProvider> Renewer<D> {
             path: path.clone(),
             detail,
         };
-        let renew_at = renew_after(&saved.chain_pem).map_err(|err| damaged(err.to_string()))?;
+        let validity = validity(&saved.chain_pem).map_err(|err| damaged(err.to_string()))?;
         self.store
             .set_pem(saved.chain_pem.as_bytes(), saved.key_pem.as_bytes())
             .map_err(|err| damaged(err.to_string()))?;
-        Ok(Some(renew_at))
+        self.status
+            .send_modify(|status| status.validity = Some(validity));
+        Ok(Some(validity.renew_at))
     }
 
     /// Gets a new certificate, saves it, and starts serving it. Returns when
@@ -219,10 +245,12 @@ impl<D: DnsProvider> Renewer<D> {
     pub async fn renew(&self) -> Result<SystemTime, CertificateError> {
         let account = self.account().await?;
         let cert = account.issue(&self.name, &self.dns, &self.check).await?;
-        let renew_at = renew_after(&cert.chain_pem)?;
+        let validity = validity(&cert.chain_pem)?;
         self.store
             .set_pem(cert.chain_pem.as_bytes(), cert.key_pem.as_bytes())
             .map_err(|err| AcmeError::Certificate(err.to_string()))?;
+        self.status
+            .send_modify(|status| status.validity = Some(validity));
         let saved = SavedCertificate {
             name: self.name.clone(),
             directory: self.directory.url().to_owned(),
@@ -230,7 +258,7 @@ impl<D: DnsProvider> Renewer<D> {
             key_pem: cert.key_pem,
         };
         write_private_json(&self.dir.join(CERTIFICATE_FILE), &saved)?;
-        Ok(renew_at)
+        Ok(validity.renew_at)
     }
 
     /// Keeps the certificate current until `shutdown` completes. Loads the
@@ -260,6 +288,7 @@ impl<D: DnsProvider> Renewer<D> {
             }
 
             info!(name = %self.name, "getting a certificate");
+            self.status.send_modify(|status| status.renewing = true);
             let result = tokio::select! {
                 () = &mut shutdown => return,
                 result = self.renew() => result,
@@ -268,6 +297,12 @@ impl<D: DnsProvider> Renewer<D> {
                 Ok(next) => {
                     failures = 0;
                     due = next;
+                    self.status.send_modify(|status| {
+                        status.renewing = false;
+                        status.failures = 0;
+                        status.last_error = None;
+                        status.retry_at = None;
+                    });
                     info!(
                         name = %self.name,
                         "got a certificate; Accordion will renew it in {} days",
@@ -283,6 +318,12 @@ impl<D: DnsProvider> Renewer<D> {
                         delay.as_secs() / 60
                     );
                     due = SystemTime::now() + delay;
+                    self.status.send_modify(|status| {
+                        status.renewing = false;
+                        status.failures = failures;
+                        status.last_error = Some(err.to_string());
+                        status.retry_at = Some(due);
+                    });
                 }
             }
         }
@@ -470,8 +511,10 @@ mod tests {
         save_certificate(dir.path(), "accordion.example.com", &staging);
 
         let same = renewer(dir.path(), "accordion.example.com", staging.clone());
+        let status = same.status();
         assert!(same.load().unwrap().is_some());
         assert!(same.store.has_certificate());
+        assert!(status.borrow().validity.is_some());
 
         let renamed = renewer(dir.path(), "home.example.com", staging);
         assert!(renamed.load().unwrap().is_none());
@@ -483,5 +526,35 @@ mod tests {
             Directory::lets_encrypt(),
         );
         assert!(production.load().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn reports_a_failed_renewal_and_when_it_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        // Nothing listens on port 1, so getting an account fails at once.
+        let unreachable = Directory::custom("https://127.0.0.1:1/dir", None);
+        let renewer = renewer(dir.path(), "accordion.example.com", unreachable);
+        let mut status = renewer.status();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let running = tokio::spawn(renewer.run(async {
+            let _ = stopped.await;
+        }));
+
+        let failed = status
+            .wait_for(|status| status.failures == 1 && !status.renewing)
+            .await
+            .unwrap()
+            .clone();
+        stop.send(()).unwrap();
+        running.await.unwrap();
+
+        assert!(failed.validity.is_none());
+        assert!(failed.last_error.is_some());
+        let retry_in = failed
+            .retry_at
+            .unwrap()
+            .duration_since(SystemTime::now())
+            .unwrap();
+        assert!(retry_in > FIRST_RETRY_DELAY - Duration::from_secs(60));
     }
 }

@@ -245,10 +245,18 @@ async fn validation_error(
     }
 }
 
-/// When to renew the certificate: after two-thirds of its lifetime, as Let's
-/// Encrypt recommends. For a 90-day certificate, that's 30 days before it
-/// expires, which leaves time to retry if renewal fails.
-pub fn renew_after(chain_pem: &str) -> Result<SystemTime, AcmeError> {
+/// When a certificate expires, and when to renew it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Validity {
+    pub renew_at: SystemTime,
+    pub expires_at: SystemTime,
+}
+
+/// Reads when the first certificate in `chain_pem` expires, and when to renew
+/// it: after two-thirds of its lifetime, as Let's Encrypt recommends. For a
+/// 90-day certificate, that's 30 days before it expires, which leaves time to
+/// retry if renewal fails.
+pub fn validity(chain_pem: &str) -> Result<Validity, AcmeError> {
     let der = CertificateDer::from_pem_slice(chain_pem.as_bytes())
         .map_err(|err| AcmeError::Certificate(err.to_string()))?;
     let (_, cert) = x509_parser::parse_x509_certificate(&der)
@@ -256,10 +264,20 @@ pub fn renew_after(chain_pem: &str) -> Result<SystemTime, AcmeError> {
     let validity = cert.validity();
     let start = validity.not_before.timestamp();
     let end = validity.not_after.timestamp();
-    let renew_at = start + (end - start) * 2 / 3;
-    let seconds = u64::try_from(renew_at)
-        .map_err(|_| AcmeError::Certificate("it was issued before 1970".into()))?;
-    Ok(UNIX_EPOCH + Duration::from_secs(seconds))
+    let time = |seconds: i64| {
+        u64::try_from(seconds)
+            .map(|seconds| UNIX_EPOCH + Duration::from_secs(seconds))
+            .map_err(|_| AcmeError::Certificate("it was issued before 1970".into()))
+    };
+    Ok(Validity {
+        renew_at: time(start + (end - start) * 2 / 3)?,
+        expires_at: time(end)?,
+    })
+}
+
+/// When to renew the certificate in `chain_pem`. See [`validity`].
+pub fn renew_after(chain_pem: &str) -> Result<SystemTime, AcmeError> {
+    validity(chain_pem).map(|validity| validity.renew_at)
 }
 
 #[cfg(test)]
@@ -277,7 +295,13 @@ mod tests {
 
         let start = UNIX_EPOCH + Duration::from_secs(1_767_225_600); // January 1, 2026
         let lifetime = Duration::from_secs(89 * 24 * 60 * 60); // to March 31
-        assert_eq!(renew_after(&cert.pem()).unwrap(), start + lifetime * 2 / 3);
+        assert_eq!(
+            validity(&cert.pem()).unwrap(),
+            Validity {
+                renew_at: start + lifetime * 2 / 3,
+                expires_at: start + lifetime,
+            }
+        );
     }
 
     #[test]

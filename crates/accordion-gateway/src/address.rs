@@ -10,8 +10,9 @@
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, UdpSocket};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
+use tokio::sync::watch;
 use tracing::{error, info, warn};
 
 use crate::ServerName;
@@ -64,11 +65,27 @@ pub fn detect_address() -> io::Result<Ipv4Addr> {
     }
 }
 
+/// How the name's address record is doing, for the health page.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AddressStatus {
+    /// The address the name points at, once Accordion has published it.
+    pub published: Option<IpAddr>,
+    /// Why Accordion can't find its own address, while it can't.
+    pub not_found: Option<String>,
+    /// How many updates in a row have failed. A success resets it.
+    pub failures: u32,
+    /// Why the last update failed, until one succeeds.
+    pub last_error: Option<String>,
+    /// When Accordion tries again after a failure.
+    pub retry_at: Option<SystemTime>,
+}
+
 /// Keeps one name's address record up to date.
 pub struct AddressPublisher<D> {
     name: ServerName,
     dns: D,
     source: AddressSource,
+    status: watch::Sender<AddressStatus>,
 }
 
 impl AddressPublisher<Provider> {
@@ -85,7 +102,17 @@ impl AddressPublisher<Provider> {
 
 impl<D: DnsProvider> AddressPublisher<D> {
     pub fn new(name: ServerName, dns: D, source: AddressSource) -> Self {
-        Self { name, dns, source }
+        Self {
+            name,
+            dns,
+            source,
+            status: watch::Sender::default(),
+        }
+    }
+
+    /// Follows the record's status as the publisher works.
+    pub fn status(&self) -> watch::Receiver<AddressStatus> {
+        self.status.subscribe()
     }
 
     /// Publishes the address at startup, then again whenever it changes,
@@ -99,6 +126,8 @@ impl<D: DnsProvider> AddressPublisher<D> {
         loop {
             let wait = match self.source.address() {
                 Err(err) => {
+                    self.status
+                        .send_modify(|status| status.not_found = Some(err.to_string()));
                     if !warned {
                         warn!(
                             name = %self.name,
@@ -109,9 +138,13 @@ impl<D: DnsProvider> AddressPublisher<D> {
                     }
                     CHECK_INTERVAL
                 }
-                Ok(address) if published == Some(address) => CHECK_INTERVAL,
+                Ok(address) if published == Some(address) => {
+                    self.status.send_modify(|status| status.not_found = None);
+                    CHECK_INTERVAL
+                }
                 Ok(address) => {
                     warned = false;
+                    self.status.send_modify(|status| status.not_found = None);
                     let result = tokio::select! {
                         () = &mut shutdown => return,
                         result = self.dns.set_address(self.name.as_str(), address) => result,
@@ -121,6 +154,10 @@ impl<D: DnsProvider> AddressPublisher<D> {
                             info!(name = %self.name, %address, "pointed the name at the server");
                             published = Some(address);
                             failures = 0;
+                            self.status.send_replace(AddressStatus {
+                                published,
+                                ..AddressStatus::default()
+                            });
                             CHECK_INTERVAL
                         }
                         Err(err) => {
@@ -131,6 +168,11 @@ impl<D: DnsProvider> AddressPublisher<D> {
                                 "{err} Accordion will try again in {} minutes.",
                                 delay.as_secs() / 60
                             );
+                            self.status.send_modify(|status| {
+                                status.failures = failures;
+                                status.last_error = Some(err.to_string());
+                                status.retry_at = Some(SystemTime::now() + delay);
+                            });
                             delay
                         }
                     }
@@ -194,14 +236,30 @@ mod tests {
             dns.clone(),
             AddressSource::Fixed(address),
         );
+        let mut status = publisher.status();
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let running = tokio::spawn(publisher.run(async {
             let _ = stopped.await;
         }));
 
-        // Time is paused, so these 10 minutes pass at once: a failure, a
-        // retry a minute later, then checks that find nothing new.
+        let failed = status
+            .wait_for(|status| status.failures == 1)
+            .await
+            .unwrap()
+            .clone();
+        assert_eq!(failed.published, None);
+        assert!(failed.last_error.unwrap().contains("Throttled."));
+
+        // Time is paused, so these 10 minutes pass at once: a retry a
+        // minute after the failure, then checks that find nothing new.
         tokio::time::sleep(Duration::from_secs(10 * 60)).await;
+        assert_eq!(
+            *status.borrow(),
+            AddressStatus {
+                published: Some(address),
+                ..AddressStatus::default()
+            }
+        );
         stop.send(()).unwrap();
         running.await.unwrap();
 
