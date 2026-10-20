@@ -19,10 +19,12 @@ use crate::http::{BoxError, Client, Reply};
 const PROVIDER: &str = "deSEC";
 const API: &str = "https://desec.io/api/v1";
 
-/// In a test on October 19, 2026, `ns1.desec.io` served a new record after 6
-/// seconds and `ns2.desec.org` after 59. Accordion waits for both, then this
-/// long more for their copies elsewhere. It's a starting value to tune.
-const PROPAGATION_DELAY: Duration = Duration::from_secs(30);
+/// Both nameservers are anycast, so Accordion's check reaches the copies near
+/// the server, while Let's Encrypt checks from other places whose copies can
+/// lag behind. Accordion waits for both nameservers, then this long more. On
+/// October 20, 2026, 30 seconds wasn't enough: Let's Encrypt still got
+/// NXDOMAIN. Other deSEC users report that waits of 2–5 minutes work.
+const PROPAGATION_DELAY: Duration = Duration::from_secs(120);
 
 #[derive(Clone)]
 pub struct Desec {
