@@ -28,6 +28,8 @@ use tokio_rustls::TlsAcceptor;
 use tower::ServiceExt;
 use tracing::{debug, warn};
 
+use crate::peer::Peer;
+
 /// How long a client gets to finish the TLS handshake, and then to send its
 /// request headers. Without a limit, slow clients could hold connections open
 /// until the server runs out.
@@ -111,7 +113,8 @@ pub fn server_config(certs: Arc<CertStore>) -> Arc<ServerConfig> {
 /// Serves `router` over TLS on `listener` until `shutdown` completes, then
 /// waits briefly for open connections to finish.
 ///
-/// Handlers can read the client's address with `ConnectInfo<SocketAddr>`.
+/// Handlers can read both ends of the connection with `ConnectInfo<Peer>`,
+/// or only the client's address with `ConnectInfo<SocketAddr>`.
 pub async fn serve(
     listener: TcpListener,
     config: Arc<ServerConfig>,
@@ -164,6 +167,10 @@ async fn serve_connection(
     router: Router,
     mut stop: watch::Receiver<bool>,
 ) {
+    let connection = Peer {
+        local: stream.local_addr().unwrap_or(peer),
+        remote: peer,
+    };
     let tls = match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
         Ok(Ok(tls)) => tls,
         Ok(Err(err)) => {
@@ -178,6 +185,7 @@ async fn serve_connection(
 
     let service = router.map_request(move |mut request: hyper::Request<Incoming>| {
         request.extensions_mut().insert(ConnectInfo(peer));
+        request.extensions_mut().insert(ConnectInfo(connection));
         request
     });
 

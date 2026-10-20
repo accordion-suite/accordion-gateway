@@ -16,6 +16,7 @@ This repo is part of [Accordion](https://github.com/accordion-suite/accordion), 
 | `certificates` | Storing the server's name, DNS settings, and certificate, renewing the certificate in the background, and reporting how renewal is going |
 | `dns` | DNS providers that publish the challenge and address records: deSEC and Cloudflare |
 | `address` | Pointing the server's name at its address on the home network, and updating it when the address changes |
+| `peer` | Both ends of a connection, and whether the client is on the home network |
 | `local_name` | Announcing `accordion.local` on the home network with multicast DNS, so people can find the setup wizard |
 | `propagation` | Waiting until every nameserver serves the challenge record, before the certificate authority looks |
 

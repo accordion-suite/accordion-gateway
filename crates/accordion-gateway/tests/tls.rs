@@ -3,6 +3,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use accordion_gateway::Peer;
 use accordion_gateway::tls::{self, CertError, CertStore};
 use axum::Router;
 use axum::extract::ConnectInfo;
@@ -42,9 +43,14 @@ async fn start(certs: Arc<CertStore>) -> TestServer {
     let router =
         Router::new().route(
             "/",
-            get(|ConnectInfo(peer): ConnectInfo<SocketAddr>| async move {
-                format!("hello {}", peer.ip())
-            }),
+            get(
+                |ConnectInfo(remote): ConnectInfo<SocketAddr>,
+                 ConnectInfo(peer): ConnectInfo<Peer>| async move {
+                    assert_eq!(peer.remote, remote);
+                    assert!(peer.on_home_network());
+                    format!("hello {} at {}", remote.ip(), peer.local.ip())
+                },
+            ),
         );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -104,7 +110,10 @@ async fn serves_requests_over_tls_with_the_client_address() {
 
     let response = get_root(server.address, &cert.der).await.unwrap();
     assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
-    assert!(response.ends_with("hello 127.0.0.1"), "{response}");
+    assert!(
+        response.ends_with("hello 127.0.0.1 at 127.0.0.1"),
+        "{response}"
+    );
 
     server.stop.send(()).unwrap();
     server.task.await.unwrap();

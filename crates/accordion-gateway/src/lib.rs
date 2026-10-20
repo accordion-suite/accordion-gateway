@@ -13,6 +13,7 @@ pub mod host;
 mod http;
 pub mod local_name;
 pub mod name;
+pub mod peer;
 pub mod propagation;
 pub mod redirect;
 mod retry;
@@ -20,4 +21,5 @@ pub mod tls;
 
 pub use host::AllowedHosts;
 pub use name::ServerName;
+pub use peer::Peer;
 pub use propagation::PropagationCheck;
