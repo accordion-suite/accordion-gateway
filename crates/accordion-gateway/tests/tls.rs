@@ -9,7 +9,7 @@ use axum::Router;
 use axum::extract::ConnectInfo;
 use axum::routing::get;
 use rustls::pki_types::{CertificateDer, ServerName};
-use rustls::{ClientConfig, RootCertStore};
+use rustls::{ClientConfig, ProtocolVersion, RootCertStore, SupportedProtocolVersion};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
@@ -76,11 +76,23 @@ async fn get_root(
     address: SocketAddr,
     trusted: &CertificateDer<'static>,
 ) -> std::io::Result<String> {
+    get_root_with(address, trusted, &[&rustls::version::TLS13])
+        .await
+        .map(|(_, response)| response)
+}
+
+/// Like [`get_root`], from a client that offers only `versions`. Also
+/// returns the TLS version the server chose.
+async fn get_root_with(
+    address: SocketAddr,
+    trusted: &CertificateDer<'static>,
+    versions: &[&'static SupportedProtocolVersion],
+) -> std::io::Result<(ProtocolVersion, String)> {
     let mut roots = RootCertStore::empty();
     roots.add(trusted.clone()).unwrap();
     let config =
         ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_protocol_versions(&[&rustls::version::TLS13])
+            .with_protocol_versions(versions)
             .unwrap()
             .with_root_certificates(roots)
             .with_no_client_auth();
@@ -90,13 +102,14 @@ async fn get_root(
     let mut tls = connector
         .connect(ServerName::try_from(NAME).unwrap(), stream)
         .await?;
+    let version = tls.get_ref().1.protocol_version().unwrap();
     tls.write_all(
         format!("GET / HTTP/1.1\r\nHost: {NAME}\r\nConnection: close\r\n\r\n").as_bytes(),
     )
     .await?;
     let mut response = String::new();
     tls.read_to_string(&mut response).await?;
-    Ok(response)
+    Ok((version, response))
 }
 
 #[tokio::test]
@@ -114,6 +127,32 @@ async fn serves_requests_over_tls_with_the_client_address() {
         response.ends_with("hello 127.0.0.1 at 127.0.0.1"),
         "{response}"
     );
+
+    server.stop.send(()).unwrap();
+    server.task.await.unwrap();
+}
+
+#[tokio::test]
+async fn prefers_tls_1_3_and_serves_tls_1_2_for_windows() {
+    let cert = new_cert();
+    let certs = CertStore::new();
+    certs
+        .set_pem(cert.chain_pem.as_bytes(), cert.key_pem.as_bytes())
+        .unwrap();
+    let server = start(certs).await;
+
+    let both = [&rustls::version::TLS13, &rustls::version::TLS12];
+    let (version, _) = get_root_with(server.address, &cert.der, &both)
+        .await
+        .unwrap();
+    assert_eq!(version, ProtocolVersion::TLSv1_3);
+
+    // Like File Explorer's WebDAV client on many Windows PCs.
+    let (version, response) = get_root_with(server.address, &cert.der, &[&rustls::version::TLS12])
+        .await
+        .unwrap();
+    assert_eq!(version, ProtocolVersion::TLSv1_2);
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
 
     server.stop.send(()).unwrap();
     server.task.await.unwrap();

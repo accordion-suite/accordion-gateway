@@ -98,12 +98,17 @@ fn provider() -> CryptoProvider {
     rustls::crypto::ring::default_provider()
 }
 
-/// TLS settings for the server: TLS 1.3 only, as the spec requires, and
-/// HTTP/2 with a fallback to HTTP/1.1.
+/// TLS settings for the server: TLS 1.3, and HTTP/2 with a fallback to
+/// HTTP/1.1.
+///
+/// TLS 1.2 is there for Windows, whose WebDAV client behind File Explorer
+/// often allows nothing newer. rustls only offers forward-secret AEAD cipher
+/// suites for TLS 1.2, and clients that support TLS 1.3 can't be pushed down
+/// to 1.2.
 pub fn server_config(certs: Arc<CertStore>) -> Arc<ServerConfig> {
     let mut config = ServerConfig::builder_with_provider(Arc::new(provider()))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .expect("ring supports TLS 1.3")
+        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+        .expect("ring supports TLS 1.2 and 1.3")
         .with_no_client_auth()
         .with_cert_resolver(certs);
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];

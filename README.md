@@ -10,7 +10,7 @@ This repo is part of [Accordion](https://github.com/accordion-suite/accordion), 
 |---|---|
 | `name` | `ServerName`, the server's public name, which is also the passkey relying party ID |
 | `host` | Middleware that answers only requests for the server's own names, which blocks DNS rebinding |
-| `tls` | TLS 1.3 serving with a certificate that can be replaced without a restart |
+| `tls` | TLS 1.3 serving, with TLS 1.2 for older clients, and a certificate that can be replaced without a restart |
 | `redirect` | The port 80 redirect to the HTTPS name |
 | `acme` | Getting certificates from Let's Encrypt with the DNS challenge, and reading when they expire and when to renew them |
 | `certificates` | Storing the server's name, DNS settings, and certificate, renewing the certificate in the background, and reporting how renewal is going |
