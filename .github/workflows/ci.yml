@@ -21,4 +21,21 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # The same connection check as the shared workflow's tests.
+      - name: Install strace
+        run: |
+          if ! command -v strace > /dev/null; then
+            sudo apt-get update -q
+            sudo apt-get install -y -q strace
+          fi
+      - name: Get the connection check
+        uses: actions/checkout@v7
+        with:
+          repository: accordion-suite/accordion
+          path: .accordion-ci
+          sparse-checkout: scripts/check-connections.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
       - run: scripts/test-acme.sh
+        env:
+          CONNECTION_CHECK: .accordion-ci/scripts/check-connections.py

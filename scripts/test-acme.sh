@@ -103,4 +103,14 @@ if [[ "$ready" != true ]]; then
 fi
 
 cd "$repo"
-PEBBLE_ROOT="$dir/test/certs/pebble.minica.pem" cargo test --locked --test acme -- --ignored
+export PEBBLE_ROOT="$dir/test/certs/pebble.minica.pem"
+tests=(cargo test --locked --test acme)
+# CI sets CONNECTION_CHECK to the accordion repo's check-connections.py, so
+# these tests also fail if anything connects to another machine. Decision 11
+# explains why. Building first keeps cargo's own downloads out of the check.
+if [[ -n "${CONNECTION_CHECK:-}" ]]; then
+    "${tests[@]}" --no-run
+    python3 "$CONNECTION_CHECK" "${tests[@]}" --offline -- --ignored
+else
+    "${tests[@]}" -- --ignored
+fi
