@@ -85,6 +85,14 @@ pub enum ProviderKind {
 impl ProviderKind {
     const ALL: [Self; 2] = [Self::Desec, Self::Cloudflare];
 
+    /// The host of the provider's API, for the Network page.
+    pub fn api_host(self) -> &'static str {
+        match self {
+            Self::Desec => "desec.io",
+            Self::Cloudflare => "api.cloudflare.com",
+        }
+    }
+
     fn id(self) -> &'static str {
         match self {
             Self::Desec => "desec",

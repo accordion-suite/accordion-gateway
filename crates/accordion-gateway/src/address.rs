@@ -121,6 +121,11 @@ pub struct AddressStatus {
     pub last_error: Option<String>,
     /// When Accordion tries again after a failure.
     pub retry_at: Option<SystemTime>,
+    /// When Accordion last asked the DNS provider to update the record,
+    /// since it started. `failures` says whether that worked.
+    pub last_attempt: Option<SystemTime>,
+    /// The admin turned updates off, so Accordion leaves the record alone.
+    pub turned_off: bool,
 }
 
 /// Keeps one name's address record up to date.
@@ -128,6 +133,7 @@ pub struct AddressPublisher<D> {
     name: ServerName,
     dns: D,
     source: AddressSource,
+    on: Option<watch::Receiver<bool>>,
     status: watch::Sender<AddressStatus>,
 }
 
@@ -149,8 +155,17 @@ impl<D: DnsProvider> AddressPublisher<D> {
             name,
             dns,
             source,
+            on: None,
             status: watch::Sender::default(),
         }
+    }
+
+    /// Updates the record only while `on` holds `true`. Turning it back on
+    /// publishes the address again right away.
+    #[must_use]
+    pub fn with_switch(mut self, on: watch::Receiver<bool>) -> Self {
+        self.on = Some(on);
+        self
     }
 
     /// Follows the record's status as the publisher works.
@@ -162,11 +177,35 @@ impl<D: DnsProvider> AddressPublisher<D> {
     /// until `shutdown` completes.
     pub async fn run(self, shutdown: impl Future<Output = ()>) {
         let mut shutdown = std::pin::pin!(shutdown);
+        let mut on = self.on.clone();
         let mut published = None;
         let mut failures = 0;
         // Warn once when the address can't be found, not every minute.
         let mut warned = false;
         loop {
+            if let Some(switch) = &mut on
+                && !*switch.borrow_and_update()
+            {
+                // Start fresh when it's turned back on, in case the address
+                // or the record changed in the meantime.
+                published = None;
+                failures = 0;
+                warned = false;
+                self.status.send_modify(|status| {
+                    *status = AddressStatus {
+                        turned_off: true,
+                        last_attempt: status.last_attempt,
+                        ..AddressStatus::default()
+                    };
+                });
+                info!(name = %self.name, "address updates are turned off");
+                tokio::select! {
+                    () = &mut shutdown => return,
+                    () = switched(&mut on) => continue,
+                }
+            }
+            self.status
+                .send_if_modified(|status| std::mem::replace(&mut status.turned_off, false));
             let wait = match self.source.address() {
                 Err(err) => {
                     self.status
@@ -199,6 +238,7 @@ impl<D: DnsProvider> AddressPublisher<D> {
                             failures = 0;
                             self.status.send_replace(AddressStatus {
                                 published,
+                                last_attempt: Some(SystemTime::now()),
                                 ..AddressStatus::default()
                             });
                             CHECK_INTERVAL
@@ -215,6 +255,7 @@ impl<D: DnsProvider> AddressPublisher<D> {
                                 status.failures = failures;
                                 status.last_error = Some(err.to_string());
                                 status.retry_at = Some(SystemTime::now() + delay);
+                                status.last_attempt = Some(SystemTime::now());
                             });
                             delay
                         }
@@ -224,8 +265,21 @@ impl<D: DnsProvider> AddressPublisher<D> {
             tokio::select! {
                 () = &mut shutdown => return,
                 () = tokio::time::sleep(wait) => {}
+                () = switched(&mut on) => {}
             }
         }
+    }
+}
+
+/// Waits for the switch to change. Without a switch, or once its sender is
+/// gone, it never changes.
+async fn switched(on: &mut Option<watch::Receiver<bool>>) {
+    let Some(switch) = on else {
+        return std::future::pending().await;
+    };
+    if switch.changed().await.is_err() {
+        *on = None;
+        std::future::pending::<()>().await;
     }
 }
 
@@ -317,10 +371,13 @@ mod tests {
         // Time is paused, so these 10 minutes pass at once: a retry a
         // minute after the failure, then checks that find nothing new.
         tokio::time::sleep(Duration::from_secs(10 * 60)).await;
+        let now = status.borrow().clone();
+        assert!(now.last_attempt.is_some());
         assert_eq!(
-            *status.borrow(),
+            now,
             AddressStatus {
                 published: Some(address),
+                last_attempt: now.last_attempt,
                 ..AddressStatus::default()
             }
         );
@@ -332,5 +389,56 @@ mod tests {
             *dns.published.lock().unwrap(),
             [(name.clone(), address), (name, address)]
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn leaves_the_record_alone_while_turned_off() {
+        let dns = FlakyDns::default();
+        // FlakyDns fails its first update. Count one already, so the update
+        // after turning it on works.
+        dns.published
+            .lock()
+            .unwrap()
+            .push(("earlier".into(), "192.168.1.1".parse().unwrap()));
+        let address: IpAddr = "192.168.1.20".parse().unwrap();
+        let (switch, on) = watch::channel(false);
+        let publisher = AddressPublisher::new(
+            "accordion.example.com".parse().unwrap(),
+            dns.clone(),
+            AddressSource::Fixed(address),
+        )
+        .with_switch(on);
+        let mut status = publisher.status();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let running = tokio::spawn(publisher.run(async {
+            let _ = stopped.await;
+        }));
+
+        status.wait_for(|status| status.turned_off).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(10 * 60)).await;
+        assert_eq!(dns.published.lock().unwrap().len(), 1);
+
+        switch.send(true).unwrap();
+        let published = status
+            .wait_for(|status| status.published.is_some())
+            .await
+            .unwrap()
+            .clone();
+        assert!(!published.turned_off);
+        assert_eq!(published.published, Some(address));
+
+        switch.send(false).unwrap();
+        let off = status
+            .wait_for(|status| status.turned_off)
+            .await
+            .unwrap()
+            .clone();
+        assert_eq!(off.published, None);
+        assert_eq!(off.last_attempt, published.last_attempt);
+        tokio::time::sleep(Duration::from_secs(10 * 60)).await;
+        assert_eq!(dns.published.lock().unwrap().len(), 2);
+
+        stop.send(()).unwrap();
+        running.await.unwrap();
     }
 }

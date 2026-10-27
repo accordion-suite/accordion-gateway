@@ -157,6 +157,9 @@ pub struct CertificateStatus {
     pub last_error: Option<String>,
     /// When Accordion tries again after a failure.
     pub retry_at: Option<SystemTime>,
+    /// When Accordion last finished trying to get a certificate, since it
+    /// started. `failures` says whether that worked.
+    pub last_attempt: Option<SystemTime>,
 }
 
 /// Gets, stores, and renews the certificate for one name.
@@ -302,6 +305,7 @@ impl<D: DnsProvider> Renewer<D> {
                         status.failures = 0;
                         status.last_error = None;
                         status.retry_at = None;
+                        status.last_attempt = Some(SystemTime::now());
                     });
                     info!(
                         name = %self.name,
@@ -323,6 +327,7 @@ impl<D: DnsProvider> Renewer<D> {
                         status.failures = failures;
                         status.last_error = Some(err.to_string());
                         status.retry_at = Some(due);
+                        status.last_attempt = Some(SystemTime::now());
                     });
                 }
             }

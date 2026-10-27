@@ -64,6 +64,19 @@ impl Directory {
         &self.url
     }
 
+    /// The host Accordion connects to, such as
+    /// `acme-v02.api.letsencrypt.org`, for the Network page.
+    pub fn host(&self) -> &str {
+        let rest = self
+            .url
+            .split_once("://")
+            .map_or(&*self.url, |(_, rest)| rest);
+        let authority = rest.split('/').next().unwrap_or(rest);
+        authority
+            .rsplit_once(':')
+            .map_or(authority, |(host, _)| host)
+    }
+
     fn builder(&self) -> Result<AccountBuilder, AcmeError> {
         Ok(match &self.root {
             Some(root) => Account::builder_with_root(root)?,
@@ -283,6 +296,18 @@ pub fn renew_after(chain_pem: &str) -> Result<SystemTime, AcmeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_the_directory_host() {
+        assert_eq!(
+            Directory::lets_encrypt().host(),
+            "acme-v02.api.letsencrypt.org"
+        );
+        assert_eq!(
+            Directory::custom("https://localhost:14000/dir", None).host(),
+            "localhost"
+        );
+    }
 
     #[test]
     fn renews_after_two_thirds_of_the_lifetime() {
