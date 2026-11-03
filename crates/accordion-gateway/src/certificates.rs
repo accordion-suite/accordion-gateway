@@ -437,6 +437,10 @@ mod tests {
             unreachable!()
         }
 
+        async fn clear_address(&self, _: &str, _: bool) -> Result<(), DnsError> {
+            unreachable!()
+        }
+
         fn propagation_delay(&self) -> Duration {
             Duration::ZERO
         }

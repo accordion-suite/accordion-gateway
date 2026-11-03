@@ -84,6 +84,12 @@ impl DnsProvider for ChallTestSrv {
         self.post(path, body.to_string()).await
     }
 
+    async fn clear_address(&self, name: &str, ipv6: bool) -> Result<(), DnsError> {
+        let path = if ipv6 { "/clear-aaaa" } else { "/clear-a" };
+        let body = serde_json::json!({ "host": format!("{name}.") });
+        self.post(path, body.to_string()).await
+    }
+
     fn propagation_delay(&self) -> Duration {
         Duration::ZERO
     }
@@ -103,6 +109,10 @@ impl DnsProvider for Forgetful {
     }
 
     async fn set_address(&self, _name: &str, _address: IpAddr) -> Result<(), DnsError> {
+        Ok(())
+    }
+
+    async fn clear_address(&self, _name: &str, _ipv6: bool) -> Result<(), DnsError> {
         Ok(())
     }
 

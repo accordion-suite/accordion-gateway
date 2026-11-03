@@ -1,5 +1,5 @@
 //! The gateway: TLS, certificates, the host name check, and the redirect from
-//! HTTP to HTTPS.
+//! HTTP to HTTPS, and remote access through WireGuard.
 //!
 //! Every client request reaches the server through this crate. It's a library
 //! in the server binary, like the modules, rather than a separate process.
@@ -9,15 +9,18 @@ pub mod acme;
 pub mod address;
 pub mod certificates;
 pub mod dns;
+pub mod endpoint;
 pub mod host;
 mod http;
 pub mod local_name;
 pub mod name;
 pub mod peer;
+pub mod port_mapping;
 pub mod propagation;
 pub mod redirect;
 mod retry;
 pub mod tls;
+pub mod tunnel;
 
 pub use host::AllowedHosts;
 pub use name::ServerName;

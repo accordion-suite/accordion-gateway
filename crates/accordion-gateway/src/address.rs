@@ -38,7 +38,8 @@ pub enum AddressSource {
 }
 
 impl AddressSource {
-    fn address(self) -> io::Result<IpAddr> {
+    /// The address, as of now.
+    pub fn address(self) -> io::Result<IpAddr> {
         match self {
             Self::Detect => detect_address().map(IpAddr::V4),
             Self::Fixed(address) => Ok(address),
@@ -338,6 +339,10 @@ mod tests {
                 });
             }
             Ok(())
+        }
+
+        async fn clear_address(&self, _: &str, _: bool) -> Result<(), DnsError> {
+            unreachable!()
         }
 
         fn propagation_delay(&self) -> Duration {

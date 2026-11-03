@@ -5,7 +5,6 @@
 //! certificate they started with.
 
 use std::future::Future;
-use std::net::SocketAddr;
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
@@ -21,14 +20,16 @@ use rustls::pki_types::pem::{self, PemObject};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 use tower::ServiceExt;
 use tracing::{debug, warn};
 
 use crate::peer::Peer;
+use crate::tunnel::Accepted;
 
 /// How long a client gets to finish the TLS handshake, and then to send its
 /// request headers. Without a limit, slow clients could hold connections open
@@ -136,10 +137,14 @@ pub async fn serve(
             () = &mut shutdown => break,
             accepted = listener.accept() => match accepted {
                 Ok((stream, peer)) => {
+                    let connection = Peer {
+                        local: stream.local_addr().unwrap_or(peer),
+                        remote: peer,
+                    };
                     connections.spawn(serve_connection(
-                        acceptor.clone(),
+                        Some(acceptor.clone()),
                         stream,
-                        peer,
+                        connection,
                         router.clone(),
                         stop.clone(),
                     ));
@@ -165,16 +170,67 @@ pub async fn serve(
     }
 }
 
-async fn serve_connection(
-    acceptor: TlsAcceptor,
-    stream: tokio::net::TcpStream,
-    peer: SocketAddr,
+/// Serves `router` to the connections that come through the tunnel
+/// (decision 21) until `shutdown` completes, the same way [`serve`] serves
+/// its listener's. Without `config`, it serves plain HTTP, for the redirect
+/// to HTTPS.
+pub async fn serve_tunnel(
+    mut incoming: mpsc::Receiver<Accepted>,
+    config: Option<Arc<ServerConfig>>,
     router: Router,
-    mut stop: watch::Receiver<bool>,
+    shutdown: impl Future<Output = ()>,
 ) {
-    let connection = Peer {
-        local: stream.local_addr().unwrap_or(peer),
-        remote: peer,
+    let acceptor = config.map(TlsAcceptor::from);
+    let (stop_sender, stop) = watch::channel(false);
+    let mut connections = JoinSet::new();
+    let mut shutdown = std::pin::pin!(shutdown);
+
+    loop {
+        tokio::select! {
+            () = &mut shutdown => break,
+            accepted = incoming.recv() => match accepted {
+                Some(Accepted { stream, peer }) => {
+                    connections.spawn(serve_connection(
+                        acceptor.clone(),
+                        stream,
+                        peer,
+                        router.clone(),
+                        stop.clone(),
+                    ));
+                }
+                // The tunnel's gone for good, but connections already open
+                // can finish.
+                None => {
+                    shutdown.as_mut().await;
+                    break;
+                }
+            },
+            Some(_) = connections.join_next(), if !connections.is_empty() => {}
+        }
+    }
+
+    let _ = stop_sender.send(true);
+    if tokio::time::timeout(DRAIN_TIMEOUT, connections.join_all())
+        .await
+        .is_err()
+    {
+        debug!("closed tunnel connections that were still open at shutdown");
+    }
+}
+
+async fn serve_connection<S>(
+    acceptor: Option<TlsAcceptor>,
+    stream: S,
+    connection: Peer,
+    router: Router,
+    stop: watch::Receiver<bool>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let peer = connection.remote;
+    let Some(acceptor) = acceptor else {
+        serve_http(TokioIo::new(stream), connection, router, stop).await;
+        return;
     };
     let tls = match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
         Ok(Ok(tls)) => tls,
@@ -187,7 +243,20 @@ async fn serve_connection(
             return;
         }
     };
+    serve_http(TokioIo::new(tls), connection, router, stop).await;
+}
 
+/// Serves HTTP/1.1 or HTTP/2 on a connection, TLS or not, until it ends or
+/// the server stops.
+async fn serve_http<I>(
+    io: TokioIo<I>,
+    connection: Peer,
+    router: Router,
+    mut stop: watch::Receiver<bool>,
+) where
+    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let peer = connection.remote;
     let service = router.map_request(move |mut request: hyper::Request<Incoming>| {
         request.extensions_mut().insert(ConnectInfo(peer));
         request.extensions_mut().insert(ConnectInfo(connection));
@@ -200,8 +269,7 @@ async fn serve_connection(
         .timer(TokioTimer::new())
         .header_read_timeout(HEADER_READ_TIMEOUT);
     builder.http2().timer(TokioTimer::new());
-    let connection = builder
-        .serve_connection_with_upgrades(TokioIo::new(tls), TowerToHyperService::new(service));
+    let connection = builder.serve_connection_with_upgrades(io, TowerToHyperService::new(service));
     let mut connection = std::pin::pin!(connection);
 
     let result = tokio::select! {

@@ -3,7 +3,9 @@
 //!
 //! API reference: <https://desec.readthedocs.io/en/latest/dns/rrsets.html>.
 //! The admin guide should explain how to limit the token with token policies
-//! to two records: the `_acme-challenge` TXT record and the name's A record.
+//! to the records Accordion changes: the `_acme-challenge` TXT record, the
+//! name's A record, and, with remote access, the A and AAAA records of its
+//! random label (decision 21).
 
 use std::fmt;
 use std::net::IpAddr;
@@ -19,6 +21,10 @@ use crate::http::{BoxError, Client, Reply};
 const PROVIDER: &str = "deSEC";
 const API: &str = "https://desec.io/api/v1";
 
+/// deSEC's dynamic DNS service, on IPv4 only, so the address it sees is the
+/// home's public IPv4 address.
+pub(crate) const UPDATE_HOST: &str = "update4.dedyn.io";
+
 /// Both nameservers are anycast, so Accordion's check reaches the copies near
 /// the server, while Let's Encrypt checks from other places whose copies can
 /// lag behind. Accordion waits for both nameservers, then this long more. On
@@ -31,6 +37,8 @@ pub struct Desec {
     client: Client,
     api: String,
     token: String,
+    /// The dynamic DNS service, which tests point elsewhere.
+    update: String,
 }
 
 /// The deSEC domain that a record belongs to.
@@ -53,6 +61,7 @@ impl Desec {
             client: Client::new()?,
             api: API.to_owned(),
             token: token.into(),
+            update: format!("https://{UPDATE_HOST}"),
         })
     }
 
@@ -62,7 +71,26 @@ impl Desec {
             client: Client::allowing_http(),
             api: api.to_owned(),
             token: token.to_owned(),
+            update: api.to_owned(),
         }
+    }
+
+    /// Points `name`'s A record at the address this request comes from,
+    /// through deSEC's dynamic DNS service. Its AAAA record stays as it is.
+    pub(crate) async fn set_address_from_source(&self, name: &str) -> Result<(), DnsError> {
+        use base64::Engine;
+        let url = format!("{}/?hostname={name}&myipv6=preserve", self.update);
+        let credentials =
+            base64::engine::general_purpose::STANDARD.encode(format!("{name}:{}", self.token));
+        let reply = self
+            .client
+            .send_json(Method::GET, &url, &format!("Basic {credentials}"), None)
+            .await
+            .map_err(|source| DnsError::Unreachable {
+                provider: PROVIDER,
+                source,
+            })?;
+        check(&reply, name)
     }
 
     async fn domain_for(&self, record: &str) -> Result<Domain, DnsError> {
@@ -220,6 +248,14 @@ impl DnsProvider for Desec {
             .await
     }
 
+    async fn clear_address(&self, name: &str, ipv6: bool) -> Result<(), DnsError> {
+        let domain = self.domain_for(name).await?;
+        let kind = if ipv6 { "AAAA" } else { "A" };
+        let rrset = json!({ "subname": subname(name, &domain.name), "type": kind, "records": [] });
+        self.write_rrset(Method::PATCH, &domain.name, rrset, name)
+            .await
+    }
+
     fn propagation_delay(&self) -> Duration {
         PROPAGATION_DELAY
     }
@@ -276,6 +312,20 @@ mod tests {
             .route(
                 "/domains/example.com/rrsets/{subname}/{kind}/",
                 get(read_rrset),
+            )
+            // The dynamic DNS service, which the test serves from the same
+            // place.
+            .route(
+                "/",
+                get(|State((fake, _)): State<(FakeDesec, StatusCode)>,
+                     headers: HeaderMap,
+                     Query(query): Query<Vec<(String, String)>>| async move {
+                    fake.writes.lock().unwrap().push((
+                        headers[AUTHORIZATION].to_str().unwrap().to_owned(),
+                        json!(query),
+                    ));
+                    "good"
+                }),
             )
             .with_state((fake.clone(), status));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -335,6 +385,32 @@ mod tests {
         assert_eq!(
             writes[1].1,
             json!([{ "subname": "_acme-challenge.accordion", "type": "TXT", "records": [] }])
+        );
+    }
+
+    #[tokio::test]
+    async fn sets_the_public_address_and_clears_it() {
+        let (desec, fake) = start(StatusCode::OK).await;
+        let name = "k3x9q2wm7f.accordion.example.com";
+
+        desec.set_address_from_source(name).await.unwrap();
+        desec.clear_address(name, false).await.unwrap();
+
+        let writes = fake.writes.lock().unwrap();
+        // The username is the name, and the password is the token.
+        assert_eq!(
+            writes[0],
+            (
+                "Basic azN4OXEyd203Zi5hY2NvcmRpb24uZXhhbXBsZS5jb206c2VjcmV0".into(),
+                json!([["hostname", name], ["myipv6", "preserve"]])
+            )
+        );
+        assert_eq!(
+            writes[1],
+            (
+                "PATCH".into(),
+                json!([{ "subname": "k3x9q2wm7f.accordion", "type": "A", "records": [] }])
+            )
         );
     }
 

@@ -67,6 +67,15 @@ pub trait DnsProvider: Send + Sync {
         address: IpAddr,
     ) -> impl Future<Output = Result<(), DnsError>> + Send;
 
+    /// Removes `name`'s address records of the type that `ipv6` picks: A
+    /// for IPv4, or AAAA for IPv6. Removing records that don't exist isn't
+    /// an error.
+    fn clear_address(
+        &self,
+        name: &str,
+        ipv6: bool,
+    ) -> impl Future<Output = Result<(), DnsError>> + Send;
+
     /// Extra time to wait after the provider's nameservers serve the record,
     /// before the certificate authority looks for it. Each nameserver runs in
     /// many places, and Accordion can only ask the copy nearest to it, while
@@ -90,6 +99,15 @@ impl ProviderKind {
         match self {
             Self::Desec => "desec.io",
             Self::Cloudflare => "api.cloudflare.com",
+        }
+    }
+
+    /// Where Accordion learns the home's public address when the router
+    /// doesn't say, for the Network page.
+    pub fn public_address_host(self) -> &'static str {
+        match self {
+            Self::Desec => desec::UPDATE_HOST,
+            Self::Cloudflare => cloudflare::TRACE_HOST,
         }
     }
 
@@ -141,6 +159,31 @@ impl Provider {
     }
 }
 
+impl Provider {
+    /// Points `name`'s A record at the address the server reaches the
+    /// internet from, for when the router doesn't say what it is. deSEC's
+    /// update service sets it from where the update comes from, and says
+    /// nothing back. For Cloudflare, its trace page says what the address
+    /// is. Returns the address, if Accordion learned it.
+    pub async fn set_public_address(&self, name: &str) -> Result<Option<IpAddr>, DnsError> {
+        match self {
+            Self::Desec(dns) => dns.set_address_from_source(name).await.map(|()| None),
+            Self::Cloudflare(dns) => {
+                let address = dns.public_address().await?;
+                dns.set_address(name, address).await?;
+                Ok(Some(address))
+            }
+        }
+    }
+
+    pub fn kind(&self) -> ProviderKind {
+        match self {
+            Self::Desec(_) => ProviderKind::Desec,
+            Self::Cloudflare(_) => ProviderKind::Cloudflare,
+        }
+    }
+}
+
 impl DnsProvider for Provider {
     async fn set_txt(&self, record: &str, value: &str) -> Result<(), DnsError> {
         match self {
@@ -160,6 +203,13 @@ impl DnsProvider for Provider {
         match self {
             Self::Desec(dns) => dns.set_address(name, address).await,
             Self::Cloudflare(dns) => dns.set_address(name, address).await,
+        }
+    }
+
+    async fn clear_address(&self, name: &str, ipv6: bool) -> Result<(), DnsError> {
+        match self {
+            Self::Desec(dns) => dns.clear_address(name, ipv6).await,
+            Self::Cloudflare(dns) => dns.clear_address(name, ipv6).await,
         }
     }
 

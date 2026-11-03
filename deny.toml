@@ -22,6 +22,7 @@ ignore = []
 # Licenses that can be combined with AGPL-3.0. Check compatibility before you
 # add one.
 allow = [
+    "0BSD",
     "AGPL-3.0-only",
     "AGPL-3.0-or-later",
     "Apache-2.0",

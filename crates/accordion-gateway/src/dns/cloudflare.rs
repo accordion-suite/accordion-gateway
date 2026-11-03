@@ -23,6 +23,10 @@ use crate::http::{BoxError, Client, Reply};
 const PROVIDER: &str = "Cloudflare";
 const API: &str = "https://api.cloudflare.com/client/v4";
 
+/// Cloudflare's trace page, which says what address a request came from.
+/// Its IPv4 address, so the answer is the home's public IPv4 address.
+pub(crate) const TRACE_HOST: &str = "1.1.1.1";
+
 /// The shortest TTL Cloudflare allows on most plans. Challenge records are
 /// short-lived, so there's no reason to cache them longer.
 const TTL: u32 = 60;
@@ -40,6 +44,8 @@ pub struct Cloudflare {
     client: Client,
     api: String,
     token: String,
+    /// The trace page, which tests point elsewhere.
+    trace: String,
 }
 
 /// Every Cloudflare reply has this shape.
@@ -79,6 +85,7 @@ impl Cloudflare {
             client: Client::new()?,
             api: API.to_owned(),
             token: token.into(),
+            trace: format!("https://{TRACE_HOST}/cdn-cgi/trace"),
         })
     }
 
@@ -88,7 +95,30 @@ impl Cloudflare {
             client: Client::allowing_http(),
             api: api.to_owned(),
             token: token.to_owned(),
+            trace: format!("{api}/cdn-cgi/trace"),
         }
+    }
+
+    /// The address this request comes from, as Cloudflare's trace page
+    /// says: the home's public IPv4 address.
+    pub(crate) async fn public_address(&self) -> Result<IpAddr, DnsError> {
+        let reply = self
+            .client
+            .get(&self.trace)
+            .await
+            .map_err(|source| DnsError::Unreachable {
+                provider: PROVIDER,
+                source,
+            })?;
+        String::from_utf8_lossy(&reply.body)
+            .lines()
+            .find_map(|line| line.strip_prefix("ip=")?.trim().parse().ok())
+            .filter(|_| reply.status.is_success())
+            .ok_or_else(|| DnsError::Rejected {
+                provider: PROVIDER,
+                status: reply.status.as_u16(),
+                detail: "The trace page didn't say what the address is.".into(),
+            })
     }
 
     /// Finds the zone that holds `record` by trying each parent name, from
@@ -261,6 +291,14 @@ impl DnsProvider for Cloudflare {
         self.create(&zone, body, name).await
     }
 
+    async fn clear_address(&self, name: &str, ipv6: bool) -> Result<(), DnsError> {
+        let zone = self.zone_for(name).await?;
+        let existing = self
+            .records(&zone, if ipv6 { "AAAA" } else { "A" }, name)
+            .await?;
+        self.delete(&zone, existing, name).await
+    }
+
     fn propagation_delay(&self) -> Duration {
         PROPAGATION_DELAY
     }
@@ -354,11 +392,29 @@ mod tests {
                     },
                 ),
             )
+            .route(
+                "/cdn-cgi/trace",
+                get(|| async { "fl=123\nh=1.1.1.1\nip=203.0.113.7\nts=1762180000\n" }),
+            )
             .with_state(fake.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let api = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (Cloudflare::with_api(&api, "secret"), fake)
+    }
+
+    #[tokio::test]
+    async fn finds_the_public_address_and_clears_records() {
+        let (cloudflare, fake) = start().await;
+        assert_eq!(
+            cloudflare.public_address().await.unwrap(),
+            "203.0.113.7".parse::<IpAddr>().unwrap()
+        );
+        cloudflare
+            .clear_address("k3x9q2wm7f.accordion.example.com", false)
+            .await
+            .unwrap();
+        assert_eq!(*fake.changes.lock().unwrap(), ["delete stale"]);
     }
 
     #[tokio::test]

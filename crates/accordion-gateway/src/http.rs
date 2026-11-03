@@ -85,6 +85,12 @@ impl Client {
         self.send(request.body(Full::new(body))?).await
     }
 
+    /// Sends a GET request with no credentials.
+    pub async fn get(&self, url: &str) -> Result<Reply, BoxError> {
+        self.send(Request::builder().uri(url).body(Full::new(Bytes::new()))?)
+            .await
+    }
+
     async fn send(&self, request: Request<Full<Bytes>>) -> Result<Reply, BoxError> {
         let exchange = async {
             let response = self.inner.request(request).await?;
