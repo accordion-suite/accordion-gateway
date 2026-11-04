@@ -45,7 +45,7 @@ async fn issue_staging_certificate(dns: &impl DnsProvider) {
         dns.propagation_delay().as_secs()
     );
     let cert = account
-        .issue(&name, dns, &PropagationCheck::new())
+        .issue(&name, false, dns, &PropagationCheck::new())
         .await
         .unwrap();
 

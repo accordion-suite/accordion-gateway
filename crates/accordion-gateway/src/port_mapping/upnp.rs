@@ -13,7 +13,7 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use tokio::net::UdpSocket;
 
-use super::{Mapping, Method, Refused};
+use super::{Forward, Mapping, Method, Protocol, Refused};
 
 /// How long routers get to answer the search, and each request.
 const SEARCH_WAIT: Duration = Duration::from_secs(3);
@@ -25,7 +25,7 @@ const MAX_REPLY: usize = 256 * 1024;
 const SEARCH_TARGET: &str = "urn:schemas-upnp-org:device:InternetGatewayDevice:1";
 
 /// The description says what port mappings are called in it.
-const DESCRIPTION: &str = "Accordion remote access";
+const DESCRIPTION: &str = "Accordion";
 
 /// UPnP error codes worth a plain explanation.
 const CONFLICT: u32 = 718;
@@ -95,18 +95,19 @@ async fn describe(location: &str, from: SocketAddr) -> Option<Gateway> {
     })
 }
 
-/// Asks the router to forward UDP `port` to the server for `lifetime`.
+/// Asks the router to forward a port to the server for `lifetime`.
 pub(super) async fn map(
     gateway: &Gateway,
-    port: u16,
+    protocol: Protocol,
+    forward: Forward,
     lifetime: Duration,
 ) -> Result<Mapping, Refused> {
     let mut lease = lifetime.as_secs();
-    let mut reply = add(gateway, port, lease).await;
+    let mut reply = add(gateway, protocol, forward, lease).await;
     if matches!(reply, Err(Some(ONLY_PERMANENT))) {
         // Older routers only keep mappings until they restart.
         lease = 0;
-        reply = add(gateway, port, lease).await;
+        reply = add(gateway, protocol, forward, lease).await;
     }
     match reply {
         Ok(()) => {}
@@ -123,7 +124,7 @@ pub(super) async fn map(
     Ok(Mapping {
         method: Method::Upnp,
         external_address,
-        external_port: port,
+        external_port: forward.external,
         // A permanent lease is still renewed, in case the router restarts.
         lifetime: if lease == 0 {
             lifetime
@@ -133,10 +134,16 @@ pub(super) async fn map(
     })
 }
 
-async fn add(gateway: &Gateway, port: u16, lease: u64) -> Result<(), Option<u32>> {
+async fn add(
+    gateway: &Gateway,
+    protocol: Protocol,
+    forward: Forward,
+    lease: u64,
+) -> Result<(), Option<u32>> {
+    let (external, internal) = (forward.external, forward.internal);
     let arguments = format!(
-        "<NewRemoteHost></NewRemoteHost><NewExternalPort>{port}</NewExternalPort>\
-         <NewProtocol>UDP</NewProtocol><NewInternalPort>{port}</NewInternalPort>\
+        "<NewRemoteHost></NewRemoteHost><NewExternalPort>{external}</NewExternalPort>\
+         <NewProtocol>{protocol}</NewProtocol><NewInternalPort>{internal}</NewInternalPort>\
          <NewInternalClient>{own}</NewInternalClient><NewEnabled>1</NewEnabled>\
          <NewPortMappingDescription>{DESCRIPTION}</NewPortMappingDescription>\
          <NewLeaseDuration>{lease}</NewLeaseDuration>",
@@ -145,11 +152,11 @@ async fn add(gateway: &Gateway, port: u16, lease: u64) -> Result<(), Option<u32>
     soap(gateway, "AddPortMapping", &arguments).await.map(drop)
 }
 
-/// Removes the mapping for UDP `port`.
-pub(super) async fn unmap(gateway: &Gateway, port: u16) {
+/// Removes the mapping for `port` on the router's public address.
+pub(super) async fn unmap(gateway: &Gateway, protocol: Protocol, port: u16) {
     let arguments = format!(
         "<NewRemoteHost></NewRemoteHost><NewExternalPort>{port}</NewExternalPort>\
-         <NewProtocol>UDP</NewProtocol>"
+         <NewProtocol>{protocol}</NewProtocol>"
     );
     let _ = soap(gateway, "DeletePortMapping", &arguments).await;
 }

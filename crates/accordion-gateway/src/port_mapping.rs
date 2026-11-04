@@ -70,6 +70,55 @@ fn default_gateway(routes: &str) -> Option<Ipv4Addr> {
     })
 }
 
+/// What a forwarded port carries: remote access's WireGuard packets, or
+/// link sharing's HTTPS (decision 22).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Protocol {
+    Udp,
+    Tcp,
+}
+
+impl Protocol {
+    /// The IP protocol number, as PCP names it.
+    fn number(self) -> u8 {
+        match self {
+            Self::Udp => 17,
+            Self::Tcp => 6,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Udp => "UDP",
+            Self::Tcp => "TCP",
+        }
+    }
+}
+
+impl fmt::Display for Protocol {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A port to forward: `external` on the router's public address, to
+/// `internal` on the server.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Forward {
+    pub internal: u16,
+    pub external: u16,
+}
+
+impl Forward {
+    /// The same port outside and in.
+    pub fn same(port: u16) -> Self {
+        Self {
+            internal: port,
+            external: port,
+        }
+    }
+}
+
 /// How a router agreed to forward the port.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Method {
@@ -137,7 +186,8 @@ pub fn is_shared(address: IpAddr) -> bool {
 /// How the port mapping is doing, for the remote access and health pages.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PortStatus {
-    /// The port Accordion wants forwarded, while remote access is on.
+    /// The port Accordion wants forwarded on the router's public address,
+    /// while it wants one.
     pub port: Option<u16>,
     /// What the router agreed to.
     pub mapping: Option<Mapping>,
@@ -152,16 +202,21 @@ pub struct PortStatus {
     pub last_attempt: Option<SystemTime>,
 }
 
-/// Keeps one UDP port forwarded while `port` holds one.
+/// Keeps one port forwarded while `port` holds one.
 pub struct PortMapper {
     router: Option<Router>,
-    port: watch::Receiver<Option<u16>>,
+    protocol: Protocol,
+    port: watch::Receiver<Option<Forward>>,
     status: watch::Sender<PortStatus>,
     nonce: [u8; 12],
 }
 
 impl PortMapper {
-    pub fn new(router: Option<Router>, port: watch::Receiver<Option<u16>>) -> Self {
+    pub fn new(
+        router: Option<Router>,
+        protocol: Protocol,
+        port: watch::Receiver<Option<Forward>>,
+    ) -> Self {
         use ring::rand::{SecureRandom, SystemRandom};
         let mut nonce = [0; 12];
         SystemRandom::new()
@@ -169,6 +224,7 @@ impl PortMapper {
             .expect("the operating system's random number generator works");
         Self {
             router,
+            protocol,
             port,
             status: watch::Sender::default(),
             nonce,
@@ -185,39 +241,42 @@ impl PortMapper {
     /// it ends on its own if the server doesn't come back.
     pub async fn run(mut self, shutdown: impl Future<Output = ()>) {
         let mut shutdown = std::pin::pin!(shutdown);
-        let mut mapped: Option<(u16, Mapping, Option<upnp::Gateway>)> = None;
+        let mut mapped: Option<(Forward, Mapping, Option<upnp::Gateway>)> = None;
+        let protocol = self.protocol;
         loop {
             let wanted = *self.port.borrow_and_update();
-            if let Some((port, mapping, gateway)) =
-                mapped.take_if(|(port, ..)| Some(*port) != wanted)
+            if let Some((forward, mapping, gateway)) =
+                mapped.take_if(|(forward, ..)| Some(*forward) != wanted)
             {
-                self.unmap(port, mapping.method, gateway.as_ref()).await;
-                info!(port, "removed the router's port mapping");
+                self.unmap(forward, mapping.method, gateway.as_ref()).await;
+                info!(%protocol, port = forward.external, "removed the router's port mapping");
             }
             let wait = match wanted {
                 None => {
                     self.status.send_replace(PortStatus::default());
                     None
                 }
-                Some(port) => {
+                Some(forward) => {
+                    let port = forward.external;
                     self.status.send_modify(|status| status.port = Some(port));
-                    let attempt = self.map(port).await;
+                    let attempt = self.map(forward).await;
                     let now = SystemTime::now();
                     match attempt {
                         Ok((mapping, gateway)) => {
                             let shared = mapping.external_address.is_some_and(is_shared);
                             if mapped.is_none() {
                                 info!(
+                                    %protocol,
                                     port,
                                     external_port = mapping.external_port,
                                     method = %mapping.method,
-                                    "the router forwards remote access's port"
+                                    "the router forwards a port to the server"
                                 );
                             }
                             if shared {
                                 warn!(
                                     "The router's public address is shared or private, so \
-                                     devices away from home can't reach it."
+                                     nobody outside the home can reach it."
                                 );
                             }
                             self.status.send_replace(PortStatus {
@@ -227,13 +286,13 @@ impl PortMapper {
                                 last_attempt: Some(now),
                                 ..PortStatus::default()
                             });
-                            mapped = Some((port, mapping, gateway));
+                            mapped = Some((forward, mapping, gateway));
                             Some((mapping.lifetime / 2).clamp(Duration::from_secs(60), LIFETIME))
                         }
                         Err((problem, no_answer)) => {
                             if self.status.borrow().problem.as_ref() != Some(&problem) {
                                 warn!(
-                                    "Accordion couldn't get the router to forward UDP port {port}: {problem}"
+                                    "Accordion couldn't get the router to forward {protocol} port {port}: {problem}"
                                 );
                             }
                             self.status.send_replace(PortStatus {
@@ -268,7 +327,10 @@ impl PortMapper {
 
     /// Asks each protocol in turn. On failure, returns why, and whether no
     /// router answered at all.
-    async fn map(&self, port: u16) -> Result<(Mapping, Option<upnp::Gateway>), (String, bool)> {
+    async fn map(
+        &self,
+        forward: Forward,
+    ) -> Result<(Mapping, Option<upnp::Gateway>), (String, bool)> {
         let Some(router) = self.router else {
             return Err((
                 "Accordion couldn't find the router: the machine has no default route.".into(),
@@ -277,11 +339,12 @@ impl PortMapper {
         };
         let lifetime = u32::try_from(LIFETIME.as_secs()).unwrap_or(u32::MAX);
         let mut refusals = Vec::new();
-        match pcp::map_pcp(router.pcp, port, lifetime, self.nonce).await {
+        let protocol = self.protocol;
+        match pcp::map_pcp(router.pcp, protocol, forward, lifetime, self.nonce).await {
             Some(Answer::Mapped(mapping)) => return Ok((mapping, None)),
             Some(Answer::Refused(refused)) => refusals.push(format!("PCP: {refused}")),
             Some(Answer::WrongVersion) => {
-                match pcp::map_nat_pmp(router.pcp, port, lifetime).await {
+                match pcp::map_nat_pmp(router.pcp, protocol, forward, lifetime).await {
                     Some(Answer::Mapped(mapping)) => return Ok((mapping, None)),
                     Some(Answer::Refused(refused)) => refusals.push(format!("NAT-PMP: {refused}")),
                     Some(Answer::WrongVersion) | None => {}
@@ -290,7 +353,7 @@ impl PortMapper {
             None => {}
         }
         if let Some(gateway) = upnp::find(router.ssdp).await {
-            match upnp::map(&gateway, port, LIFETIME).await {
+            match upnp::map(&gateway, protocol, forward, LIFETIME).await {
                 Ok(mapping) => return Ok((mapping, Some(gateway))),
                 Err(refused) => refusals.push(format!("UPnP: {refused}")),
             }
@@ -310,18 +373,19 @@ impl PortMapper {
         }
     }
 
-    async fn unmap(&self, port: u16, method: Method, gateway: Option<&upnp::Gateway>) {
+    async fn unmap(&self, forward: Forward, method: Method, gateway: Option<&upnp::Gateway>) {
         let Some(router) = self.router else { return };
+        let protocol = self.protocol;
         match method {
             Method::Pcp => {
-                pcp::map_pcp(router.pcp, port, 0, self.nonce).await;
+                pcp::map_pcp(router.pcp, protocol, forward, 0, self.nonce).await;
             }
             Method::NatPmp => {
-                pcp::map_nat_pmp(router.pcp, port, 0).await;
+                pcp::map_nat_pmp(router.pcp, protocol, forward, 0).await;
             }
             Method::Upnp => {
                 if let Some(gateway) = gateway {
-                    upnp::unmap(gateway, port).await;
+                    upnp::unmap(gateway, protocol, forward.external).await;
                 }
             }
         }

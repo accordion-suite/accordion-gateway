@@ -57,9 +57,16 @@ async fn pcp_router(speaks: Speaks, external: Ipv4Addr, log: Log) -> SocketAddr 
                 (Speaks::Pcp | Speaks::PcpRefusing, 2) => {
                     let port = u16::from_be_bytes([request[40], request[41]]);
                     let lifetime = u32::from_be_bytes(request[4..8].try_into().unwrap());
-                    log.lock()
-                        .unwrap()
-                        .push(format!("map {port} for {lifetime}"));
+                    if request[36] == 6 {
+                        let external = u16::from_be_bytes([request[42], request[43]]);
+                        log.lock()
+                            .unwrap()
+                            .push(format!("map TCP {external} to {port} for {lifetime}"));
+                    } else {
+                        log.lock()
+                            .unwrap()
+                            .push(format!("map {port} for {lifetime}"));
+                    }
                     let result = if speaks == Speaks::PcpRefusing { 2 } else { 0 };
                     let mut reply = vec![2, 0x81, 0, result];
                     reply.extend_from_slice(&request[4..8]);
@@ -145,9 +152,17 @@ async fn upnp_router(external: Ipv4Addr, log: Log) -> SocketAddr {
 fn start(
     router: Router,
     port: Option<u16>,
-) -> (watch::Sender<Option<u16>>, watch::Receiver<PortStatus>) {
-    let (switch, port) = watch::channel(port);
-    let mapper = PortMapper::new(Some(router), port);
+) -> (watch::Sender<Option<Forward>>, watch::Receiver<PortStatus>) {
+    start_for(router, Protocol::Udp, port.map(Forward::same))
+}
+
+fn start_for(
+    router: Router,
+    protocol: Protocol,
+    forward: Option<Forward>,
+) -> (watch::Sender<Option<Forward>>, watch::Receiver<PortStatus>) {
+    let (switch, port) = watch::channel(forward);
+    let mapper = PortMapper::new(Some(router), protocol, port);
     let status = mapper.status();
     tokio::spawn(mapper.run(std::future::pending()));
     (switch, status)
@@ -185,7 +200,7 @@ async fn maps_through_pcp_and_removes_the_mapping() {
     assert!(!mapped.shared_address);
 
     // A new port replaces the old one, and turning off removes it.
-    switch.send_replace(Some(51821));
+    switch.send_replace(Some(Forward::same(51821)));
     wait_for(&mut status, |status| {
         status.port == Some(51821) && status.mapping.is_some()
     })
@@ -201,6 +216,23 @@ async fn maps_through_pcp_and_removes_the_mapping() {
             "map 51821 for 0"
         ]
     );
+}
+
+#[tokio::test]
+async fn forwards_a_tcp_port_to_another_port_on_the_server() {
+    let log = Log::default();
+    let router = Router {
+        pcp: pcp_router(Speaks::Pcp, PUBLIC, log.clone()).await,
+        ssdp: silent().await,
+    };
+    let forward = Forward {
+        internal: 8443,
+        external: 443,
+    };
+    let (_switch, mut status) = start_for(router, Protocol::Tcp, Some(forward));
+    let mapped = wait_for(&mut status, |status| status.mapping.is_some()).await;
+    assert_eq!(mapped.port, Some(443));
+    assert_eq!(*log.lock().unwrap(), ["map TCP 443 to 8443 for 3600"]);
 }
 
 #[tokio::test]

@@ -29,6 +29,8 @@ use crate::{PropagationCheck, ServerName};
 const SETTINGS_FILE: &str = "settings.json";
 const ACCOUNT_FILE: &str = "account.json";
 const CERTIFICATE_FILE: &str = "certificate.json";
+/// The wildcard certificate for link sharing (decision 22).
+const WILDCARD_FILE: &str = "wildcard-certificate.json";
 
 /// The longest the renewal loop sleeps at once. It checks the clock again
 /// each time it wakes, because the clock can jump, such as after the machine
@@ -110,6 +112,9 @@ struct SavedAccount {
 #[derive(Serialize, Deserialize)]
 struct SavedCertificate {
     name: ServerName,
+    /// For every name under `name`. Older files are for `name` itself.
+    #[serde(default)]
+    wildcard: bool,
     directory: String,
     chain_pem: String,
     key_pem: String,
@@ -166,6 +171,7 @@ pub struct CertificateStatus {
 pub struct Renewer<D> {
     dir: PathBuf,
     name: ServerName,
+    wildcard: bool,
     dns: D,
     directory: Directory,
     check: PropagationCheck,
@@ -206,11 +212,37 @@ impl<D: DnsProvider> Renewer<D> {
         Self {
             dir: dir.into(),
             name,
+            wildcard: false,
             dns,
             directory,
             check,
             store,
             status: watch::Sender::default(),
+        }
+    }
+
+    /// Makes the renewer's certificate a wildcard, for every name under
+    /// its name, kept in a file of its own.
+    #[must_use]
+    pub fn wildcard(mut self) -> Self {
+        self.wildcard = true;
+        self
+    }
+
+    fn file(&self) -> PathBuf {
+        self.dir.join(if self.wildcard {
+            WILDCARD_FILE
+        } else {
+            CERTIFICATE_FILE
+        })
+    }
+
+    /// The name the certificate is for, as logs show it.
+    fn shown(&self) -> String {
+        if self.wildcard {
+            format!("*.{}", self.name)
+        } else {
+            self.name.to_string()
         }
     }
 
@@ -223,11 +255,14 @@ impl<D: DnsProvider> Renewer<D> {
     /// it. Returns `None` if there's no certificate for this name and
     /// certificate authority, so the server needs to get one now.
     pub fn load(&self) -> Result<Option<SystemTime>, CertificateError> {
-        let path = self.dir.join(CERTIFICATE_FILE);
+        let path = self.file();
         let Some(saved) = read_json::<SavedCertificate>(&path)? else {
             return Ok(None);
         };
-        if saved.name != self.name || saved.directory != self.directory.url() {
+        if saved.name != self.name
+            || saved.wildcard != self.wildcard
+            || saved.directory != self.directory.url()
+        {
             return Ok(None);
         }
         let damaged = |detail: String| CertificateError::Damaged {
@@ -247,7 +282,9 @@ impl<D: DnsProvider> Renewer<D> {
     /// to renew it.
     pub async fn renew(&self) -> Result<SystemTime, CertificateError> {
         let account = self.account().await?;
-        let cert = account.issue(&self.name, &self.dns, &self.check).await?;
+        let cert = account
+            .issue(&self.name, self.wildcard, &self.dns, &self.check)
+            .await?;
         let validity = validity(&cert.chain_pem)?;
         self.store
             .set_pem(cert.chain_pem.as_bytes(), cert.key_pem.as_bytes())
@@ -256,11 +293,12 @@ impl<D: DnsProvider> Renewer<D> {
             .send_modify(|status| status.validity = Some(validity));
         let saved = SavedCertificate {
             name: self.name.clone(),
+            wildcard: self.wildcard,
             directory: self.directory.url().to_owned(),
             chain_pem: cert.chain_pem,
             key_pem: cert.key_pem,
         };
-        write_private_json(&self.dir.join(CERTIFICATE_FILE), &saved)?;
+        write_private_json(&self.file(), &saved)?;
         Ok(validity.renew_at)
     }
 
@@ -271,7 +309,7 @@ impl<D: DnsProvider> Renewer<D> {
         let mut shutdown = std::pin::pin!(shutdown);
         let mut due = match self.load() {
             Ok(Some(due)) => {
-                info!(name = %self.name, "loaded the saved certificate");
+                info!(name = %self.shown(), "loaded the saved certificate");
                 due
             }
             Ok(None) => SystemTime::now(),
@@ -290,7 +328,7 @@ impl<D: DnsProvider> Renewer<D> {
                 }
             }
 
-            info!(name = %self.name, "getting a certificate");
+            info!(name = %self.shown(), "getting a certificate");
             self.status.send_modify(|status| status.renewing = true);
             let result = tokio::select! {
                 () = &mut shutdown => return,
@@ -308,7 +346,7 @@ impl<D: DnsProvider> Renewer<D> {
                         status.last_attempt = Some(SystemTime::now());
                     });
                     info!(
-                        name = %self.name,
+                        name = %self.shown(),
                         "got a certificate; Accordion will renew it in {} days",
                         days_until(next)
                     );
@@ -317,7 +355,7 @@ impl<D: DnsProvider> Renewer<D> {
                     failures += 1;
                     let delay = retry::delay(failures, FIRST_RETRY_DELAY, MAX_RETRY_DELAY);
                     error!(
-                        name = %self.name,
+                        name = %self.shown(),
                         "{err} Accordion will try again in {} minutes.",
                         delay.as_secs() / 60
                     );
@@ -465,6 +503,7 @@ mod tests {
             .unwrap();
         let saved = SavedCertificate {
             name: name.parse().unwrap(),
+            wildcard: false,
             directory: directory.url().to_owned(),
             chain_pem: cert.pem(),
             key_pem: key.serialize_pem(),

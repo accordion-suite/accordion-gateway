@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use tokio::net::UdpSocket;
 
-use super::{Mapping, Method, Refused};
+use super::{Forward, Mapping, Method, Protocol, Refused};
 
 /// How long to wait for each answer. RFC 6886 starts at 250 ms and doubles;
 /// three tries cover routers that are slow to wake up.
@@ -20,7 +20,6 @@ const WAITS: [Duration; 3] = [
 const PCP_VERSION: u8 = 2;
 const NAT_PMP_VERSION: u8 = 0;
 const MAP: u8 = 1;
-const UDP: u8 = 17;
 /// PCP's and NAT-PMP's "unsupported version" result codes.
 const UNSUPPORTED_VERSION: u8 = 1;
 
@@ -33,12 +32,13 @@ pub(super) enum Answer {
     WrongVersion,
 }
 
-/// Asks the router at `router` for UDP `port` through PCP. With a lifetime
-/// of zero, it removes the mapping instead. `nonce` has to be the same for
-/// a renewal or removal as for the request that made the mapping.
+/// Asks the router at `router` to forward a port through PCP. With a
+/// lifetime of zero, it removes the mapping instead. `nonce` has to be the
+/// same for a renewal or removal as for the request that made the mapping.
 pub(super) async fn map_pcp(
     router: SocketAddr,
-    port: u16,
+    protocol: Protocol,
+    forward: Forward,
     lifetime: u32,
     nonce: [u8; 12],
 ) -> Option<Answer> {
@@ -51,9 +51,9 @@ pub(super) async fn map_pcp(
     request.extend_from_slice(&lifetime.to_be_bytes());
     request.extend_from_slice(&own.to_ipv6_mapped().octets());
     request.extend_from_slice(&nonce);
-    request.extend_from_slice(&[UDP, 0, 0, 0]);
-    request.extend_from_slice(&port.to_be_bytes());
-    request.extend_from_slice(&port.to_be_bytes());
+    request.extend_from_slice(&[protocol.number(), 0, 0, 0]);
+    request.extend_from_slice(&forward.internal.to_be_bytes());
+    request.extend_from_slice(&forward.external.to_be_bytes());
     // Any external address.
     request.extend_from_slice(&Ipv4Addr::UNSPECIFIED.to_ipv6_mapped().octets());
 
@@ -87,16 +87,26 @@ pub(super) async fn map_pcp(
     }))
 }
 
-/// Asks the router at `router` for UDP `port` through NAT-PMP, then for the
-/// public address. With a lifetime of zero, it removes the mapping.
-pub(super) async fn map_nat_pmp(router: SocketAddr, port: u16, lifetime: u32) -> Option<Answer> {
+/// Asks the router at `router` to forward a port through NAT-PMP, then for
+/// the public address. With a lifetime of zero, it removes the mapping.
+pub(super) async fn map_nat_pmp(
+    router: SocketAddr,
+    protocol: Protocol,
+    forward: Forward,
+    lifetime: u32,
+) -> Option<Answer> {
     let socket = connected(router).await?;
-    let mut request = vec![NAT_PMP_VERSION, MAP, 0, 0];
-    request.extend_from_slice(&port.to_be_bytes());
-    request.extend_from_slice(&if lifetime == 0 { 0 } else { port }.to_be_bytes());
+    // NAT-PMP's opcodes: 1 maps UDP, and 2 maps TCP.
+    let opcode = match protocol {
+        Protocol::Udp => 1,
+        Protocol::Tcp => 2,
+    };
+    let mut request = vec![NAT_PMP_VERSION, opcode, 0, 0];
+    request.extend_from_slice(&forward.internal.to_be_bytes());
+    request.extend_from_slice(&if lifetime == 0 { 0 } else { forward.external }.to_be_bytes());
     request.extend_from_slice(&lifetime.to_be_bytes());
     let reply = ask(&socket, &request, |reply| {
-        reply.len() >= 16 && reply[0] == NAT_PMP_VERSION && reply[1] == 0x80 | MAP
+        reply.len() >= 16 && reply[0] == NAT_PMP_VERSION && reply[1] == 0x80 | opcode
     })
     .await?;
     let result = u16::from_be_bytes([reply[2], reply[3]]);

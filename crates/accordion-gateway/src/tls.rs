@@ -127,7 +127,25 @@ pub async fn serve(
     router: Router,
     shutdown: impl Future<Output = ()>,
 ) {
-    let acceptor = TlsAcceptor::from(config);
+    serve_listener(listener, Some(TlsAcceptor::from(config)), router, shutdown).await;
+}
+
+/// Serves `router` over plain HTTP on `listener`, the same way [`serve`]
+/// serves HTTPS, for a server without a name, such as in development.
+pub async fn serve_plain(
+    listener: TcpListener,
+    router: Router,
+    shutdown: impl Future<Output = ()>,
+) {
+    serve_listener(listener, None, router, shutdown).await;
+}
+
+async fn serve_listener(
+    listener: TcpListener,
+    acceptor: Option<TlsAcceptor>,
+    router: Router,
+    shutdown: impl Future<Output = ()>,
+) {
     let (stop_sender, stop) = watch::channel(false);
     let mut connections = JoinSet::new();
     let mut shutdown = std::pin::pin!(shutdown);
@@ -142,7 +160,7 @@ pub async fn serve(
                         remote: peer,
                     };
                     connections.spawn(serve_connection(
-                        Some(acceptor.clone()),
+                        acceptor.clone(),
                         stream,
                         connection,
                         router.clone(),

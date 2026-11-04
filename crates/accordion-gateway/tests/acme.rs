@@ -12,6 +12,7 @@ use accordion_gateway::dns::{DnsError, DnsProvider};
 use accordion_gateway::propagation::PropagationError;
 use accordion_gateway::tls::CertStore;
 use accordion_gateway::{PropagationCheck, ServerName};
+use rustls::pki_types::pem::PemObject;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -123,13 +124,45 @@ impl DnsProvider for Forgetful {
 
 #[tokio::test]
 #[ignore = "needs Pebble; run scripts/test-acme.sh"]
+async fn issues_a_wildcard_certificate_at_the_names_own_record() {
+    let (account, _) = AcmeAccount::create(&directory()).await.unwrap();
+    let dns = ChallTestSrv::default();
+    let name: ServerName = "wildcard.example.com".parse().unwrap();
+
+    let cert = account.issue(&name, true, &dns, &check()).await.unwrap();
+
+    let certs = CertStore::new();
+    certs
+        .set_pem(cert.chain_pem.as_bytes(), cert.key_pem.as_bytes())
+        .unwrap();
+    let der = rustls::pki_types::CertificateDer::from_pem_slice(cert.chain_pem.as_bytes()).unwrap();
+    let (_, parsed) = x509_parser::parse_x509_certificate(&der).unwrap();
+    let names: Vec<String> = parsed
+        .subject_alternative_name()
+        .unwrap()
+        .unwrap()
+        .value
+        .general_names
+        .iter()
+        .map(|name| name.to_string())
+        .collect();
+    assert_eq!(names, ["DNSName(*.wildcard.example.com)"]);
+    // The record is the name's own, without the `*.`.
+    assert_eq!(
+        *dns.cleared.lock().unwrap(),
+        ["_acme-challenge.wildcard.example.com"]
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs Pebble; run scripts/test-acme.sh"]
 async fn issues_a_certificate_through_the_dns_challenge() {
     let directory = directory();
     let (account, credentials) = AcmeAccount::create(&directory).await.unwrap();
     let dns = ChallTestSrv::default();
     let name: ServerName = "accordion.example.com".parse().unwrap();
 
-    let cert = account.issue(&name, &dns, &check()).await.unwrap();
+    let cert = account.issue(&name, false, &dns, &check()).await.unwrap();
 
     // The TLS server accepts it, which also checks that the key matches.
     let certs = CertStore::new();
@@ -148,7 +181,7 @@ async fn issues_a_certificate_through_the_dns_challenge() {
         .await
         .unwrap();
     let renewed = restored
-        .issue(&name, &ChallTestSrv::default(), &check())
+        .issue(&name, false, &ChallTestSrv::default(), &check())
         .await
         .unwrap();
     certs
@@ -164,7 +197,7 @@ async fn explains_a_failed_challenge() {
 
     // Skip the check, so the authority itself looks for the missing record.
     let result = account
-        .issue(&name, &Forgetful, &PropagationCheck::skip())
+        .issue(&name, false, &Forgetful, &PropagationCheck::skip())
         .await;
 
     match result {
@@ -183,7 +216,7 @@ async fn stops_before_the_authority_looks_if_the_record_never_appears() {
     let name: ServerName = "never-published.example.com".parse().unwrap();
 
     let check = check().timeout(Duration::from_secs(6));
-    let result = account.issue(&name, &Forgetful, &check).await;
+    let result = account.issue(&name, false, &Forgetful, &check).await;
 
     match result {
         Err(AcmeError::Propagation(PropagationError::NotPropagated { record, .. })) => {

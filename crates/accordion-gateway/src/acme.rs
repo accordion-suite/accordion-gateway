@@ -27,6 +27,11 @@ use crate::propagation::{PropagationCheck, PropagationError};
 const VALIDATION_TIMEOUT: Duration = Duration::from_secs(120);
 const ISSUE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// The server's certificate and the wildcard one for link sharing (decision
+/// 22) prove themselves with the same `_acme-challenge` record, which holds
+/// one value at a time, so they take turns.
+static CHALLENGE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// A certificate authority's ACME directory.
 #[derive(Clone, Debug)]
 pub struct Directory {
@@ -150,22 +155,30 @@ impl AcmeAccount {
         Ok(Self { account })
     }
 
-    /// Gets a certificate for `name`, proving control of it with a TXT
-    /// record that `dns` publishes. `check` confirms the record is live
+    /// Gets a certificate for `name`, or with `wildcard` for every name
+    /// under it, such as `*.ourhome.dedyn.io`, proving control of it with a
+    /// TXT record that `dns` publishes. `check` confirms the record is live
     /// before the authority looks for it. The record is removed afterward,
     /// whether or not issuing succeeds.
     pub async fn issue<D: DnsProvider>(
         &self,
         name: &ServerName,
+        wildcard: bool,
         dns: &D,
         check: &PropagationCheck,
     ) -> Result<IssuedCert, AcmeError> {
-        let identifiers = [Identifier::Dns(name.to_string())];
+        let _turn = CHALLENGE.lock().await;
+        let shown = if wildcard {
+            format!("*.{name}")
+        } else {
+            name.to_string()
+        };
+        let identifiers = [Identifier::Dns(shown.clone())];
         let mut order = self.account.new_order(&NewOrder::new(&identifiers)).await?;
 
         let mut records = Vec::new();
         let result = match publish_challenges(&mut order, dns, check, &mut records).await {
-            Ok(()) => finish(&mut order, name).await,
+            Ok(()) => finish(&mut order, &shown).await,
             Err(err) => Err(err),
         };
 
@@ -192,7 +205,12 @@ async fn publish_challenges<D: DnsProvider>(
         if authorization.status == AuthorizationStatus::Valid {
             continue;
         }
-        let identifier = authorization.identifier().to_string();
+        // A wildcard's record is at the name under it, without the `*.`.
+        let shown = authorization.identifier();
+        let identifier = match shown.identifier {
+            Identifier::Dns(name) => name.clone(),
+            _ => shown.to_string(),
+        };
         let mut challenge = authorization
             .challenge(ChallengeType::Dns01)
             .ok_or_else(|| AcmeError::NoDnsChallenge(identifier.clone()))?;
@@ -208,7 +226,7 @@ async fn publish_challenges<D: DnsProvider>(
     Ok(())
 }
 
-async fn finish(order: &mut Order, name: &ServerName) -> Result<IssuedCert, AcmeError> {
+async fn finish(order: &mut Order, name: &str) -> Result<IssuedCert, AcmeError> {
     let ready = order
         .poll_ready(&RetryPolicy::new().timeout(VALIDATION_TIMEOUT))
         .await;
@@ -234,7 +252,7 @@ async fn finish(order: &mut Order, name: &ServerName) -> Result<IssuedCert, Acme
 /// challenge's own reason over the order's.
 async fn validation_error(
     order: &mut Order,
-    name: &ServerName,
+    name: &str,
     order_detail: Option<String>,
 ) -> AcmeError {
     let mut detail = None;
