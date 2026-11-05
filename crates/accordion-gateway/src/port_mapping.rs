@@ -217,11 +217,9 @@ impl PortMapper {
         protocol: Protocol,
         port: watch::Receiver<Option<Forward>>,
     ) -> Self {
-        use ring::rand::{SecureRandom, SystemRandom};
-        let mut nonce = [0; 12];
-        SystemRandom::new()
-            .fill(&mut nonce)
-            .expect("the operating system's random number generator works");
+        let nonce = ring::rand::generate::<[u8; 12]>(&ring::rand::SystemRandom::new())
+            .expect("the operating system's random number generator works")
+            .expose();
         Self {
             router,
             protocol,
