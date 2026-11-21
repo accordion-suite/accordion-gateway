@@ -12,15 +12,18 @@ This repo is part of [Accordion](https://github.com/accordion-suite/accordion), 
 | `host` | Middleware that answers only requests for the server's own names, which blocks DNS rebinding |
 | `tls` | TLS 1.3 serving, with TLS 1.2 for older clients, and a certificate that can be replaced without a restart |
 | `redirect` | The port 80 redirect to the HTTPS name |
-| `acme` | Getting certificates from Let's Encrypt with the DNS challenge, and reading when they expire and when to renew them |
+| `acme` | Getting certificates from Let's Encrypt with the DNS challenge, including the wildcard certificate for link sharing ([decision 22](https://github.com/accordion-suite/accordion/blob/main/docs/decisions/0022-link-sharing.md)), and reading when they expire and when to renew them |
 | `certificates` | Storing the server's name, DNS settings, and certificate, renewing the certificate in the background, and reporting how renewal is going |
 | `dns` | DNS providers that publish the challenge and address records: deSEC and Cloudflare |
 | `address` | Pointing the server's name at its address on the home network, and updating it when the address changes |
 | `peer` | Both ends of a connection, and whether the client is on the home network |
 | `local_name` | Announcing `accordion.local` on the home network with multicast DNS, so people can find the setup wizard |
 | `propagation` | Waiting until every nameserver serves the challenge record, before the certificate authority looks |
+| `tunnel` | Remote access: a WireGuard server inside Accordion, in user space, with its own TCP/IP stack, so the machine needs no network interface, route, or firewall rule |
+| `port_mapping` | Asking the home router to forward a port, through PCP, NAT-PMP, or UPnP, renewing it, and noticing carrier-grade NAT from the public address the router reports |
+| `endpoint` | The address record that devices away from home find the tunnel at, under a random label of the server's name so certificate logs don't reveal the home's address |
 
-An RFC 2136 provider and WireGuard remote access are planned. [Decision 5](https://github.com/accordion-suite/accordion/blob/main/docs/decisions/0005-server-name-and-certificates.md) explains how the name and certificates work.
+An RFC 2136 provider is planned. [Decision 5](https://github.com/accordion-suite/accordion/blob/main/docs/decisions/0005-server-name-and-certificates.md) explains how the name and certificates work, and [decision 21](https://github.com/accordion-suite/accordion/blob/main/docs/decisions/0021-remote-access.md) explains remote access.
 
 ## Building
 
